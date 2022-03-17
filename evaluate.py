@@ -35,7 +35,7 @@ def get_arguments():
         default=100,
         type=int,
         choices=(100, 10, 1),
-        help="size of traing set in percent",
+        help="size of training set in percent",
     )
 
     # Checkpoint
