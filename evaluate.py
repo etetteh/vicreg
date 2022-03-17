@@ -138,41 +138,6 @@ def main_worker(gpu, args):
     torch.cuda.set_device(gpu)
     torch.backends.cudnn.benchmark = True
 
-    backbone, embedding = resnet.__dict__[args.arch](zero_init_residual=True)
-    state_dict = torch.load(args.pretrained, map_location="cpu")
-    missing_keys, unexpected_keys = backbone.load_state_dict(state_dict, strict=False)
-    assert missing_keys == [] and unexpected_keys == []
-
-    head = nn.Linear(embedding, 1000)
-    head.weight.data.normal_(mean=0.0, std=0.01)
-    head.bias.data.zero_()
-    model = nn.Sequential(backbone, head)
-    model.cuda(gpu)
-
-    if args.weights == "freeze":
-        backbone.requires_grad_(False)
-        head.requires_grad_(True)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
-
-    criterion = nn.CrossEntropyLoss().cuda(gpu)
-
-    param_groups = [dict(params=head.parameters(), lr=args.lr_head)]
-    if args.weights == "finetune":
-        param_groups.append(dict(params=backbone.parameters(), lr=args.lr_backbone))
-    optimizer = optim.SGD(param_groups, 0, momentum=0.9, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
-
-    # automatically resume from checkpoint if it exists
-    if (args.exp_dir / "checkpoint.pth").is_file():
-        ckpt = torch.load(args.exp_dir / "checkpoint.pth", map_location="cpu")
-        start_epoch = ckpt["epoch"]
-        best_acc = ckpt["best_acc"]
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-    else:
-        start_epoch = 0
-        best_acc = argparse.Namespace(top1=0, top5=0)
 
     # Data loading code
     traindir = args.data_dir / "train"
@@ -223,6 +188,43 @@ def main_worker(gpu, args):
         train_dataset, sampler=train_sampler, **kwargs
     )
     val_loader = torch.utils.data.DataLoader(val_dataset, **kwargs)
+
+    # Model definition and loading
+    backbone, embedding = resnet.__dict__[args.arch](zero_init_residual=True)
+    state_dict = torch.load(args.pretrained, map_location="cpu")
+    missing_keys, unexpected_keys = backbone.load_state_dict(state_dict, strict=False)
+    assert missing_keys == [] and unexpected_keys == []
+
+    head = nn.Linear(embedding, len(train_dataset.classes))
+    head.weight.data.normal_(mean=0.0, std=0.01)
+    head.bias.data.zero_()
+    model = nn.Sequential(backbone, head)
+    model.cuda(gpu)
+
+    if args.weights == "freeze":
+        backbone.requires_grad_(False)
+        head.requires_grad_(True)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+
+    criterion = nn.CrossEntropyLoss().cuda(gpu)
+
+    param_groups = [dict(params=head.parameters(), lr=args.lr_head)]
+    if args.weights == "finetune":
+        param_groups.append(dict(params=backbone.parameters(), lr=args.lr_backbone))
+    optimizer = optim.SGD(param_groups, 0, momentum=0.9, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
+
+    # automatically resume from checkpoint if it exists
+    if (args.exp_dir / "checkpoint.pth").is_file():
+        ckpt = torch.load(args.exp_dir / "checkpoint.pth", map_location="cpu")
+        start_epoch = ckpt["epoch"]
+        best_acc = ckpt["best_acc"]
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+    else:
+        start_epoch = 0
+        best_acc = argparse.Namespace(top1=0, top5=0)
 
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
