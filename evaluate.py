@@ -17,6 +17,7 @@ from torch import nn, optim
 from torchvision import datasets, transforms
 import torch
 
+import utils
 import resnet
 import create_subset
 
@@ -85,7 +86,12 @@ def get_arguments():
         choices=("finetune", "freeze"),
         help="finetune or freeze resnet weights",
     )
-
+    parser.add_argument(
+        "--lr-warmup-epochs",
+        default=0,
+        type=int,
+        help="the number of epochs to warmup (default: 0)"
+    )
     # Running
     parser.add_argument(
         "--workers",
@@ -94,13 +100,31 @@ def get_arguments():
         metavar="N",
         help="number of data loader workers",
     )
-
+    # Label smoothing
     parser.add_argument(
         "--label-smoothing",
         default=0.0,
         type=float,
         help="label smoothing (default: 0.0)",
         dest="label_smoothing"
+    )
+    # EMA
+    parser.add_argument(
+        "--model-ema",
+        action="store_true",
+        help="enable tracking Exponential Moving Average of model parameters"
+    )
+    parser.add_argument(
+        "--model-ema-steps",
+        type=int,
+        default=32,
+        help="the number of iterations that controls how often to update the EMA model (default: 32)",
+    )
+    parser.add_argument(
+        "--model-ema-decay",
+        type=float,
+        default=0.99998,
+        help="decay factor for Exponential Moving Average of model parameters (default: 0.99998)",
     )
     return parser
 
@@ -196,6 +220,13 @@ def main_worker(args):
     optimizer = optim.SGD(param_groups, 0, momentum=0.9, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
+    model_ema = None
+    if args.model_ema:
+        adjust = args.batch_size * args.model_ema_steps / args.epochs
+        alpha = 1.0 - args.model_ema_decay
+        alpha = min(1.0, alpha * adjust)
+        model_ema = utils.ExponentialMovingAverage(model, device=device, decay=1.0 - alpha)
+
     # automatically resume from checkpoint if it exists
     if (args.exp_dir / "checkpoint.pth").is_file():
         ckpt = torch.load(args.exp_dir / "checkpoint.pth", map_location="cpu")
@@ -204,11 +235,13 @@ def main_worker(args):
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
+        if model_ema:
+            model_ema.load_state_dict(ckpt["model_ema"])
     else:
         start_epoch = 0
         best_acc = argparse.Namespace(top1=0, top3=0)
 
-    def train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file):
+    def train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file, model_ema=None,):
         model.train()
         for step, (images, target) in enumerate(
             train_loader, start=epoch * len(train_loader)
@@ -218,6 +251,12 @@ def main_worker(args):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            if model_ema and step % args.model_ema_steps == 0:
+                model_ema.update_parameters(model)
+                if epoch < args.lr_warmup_epochs:
+                    model_ema.n_averaged.fill_(0)
+
             if step % args.print_freq == 0:
                 pg = optimizer.param_groups
                 lr_head = pg[0]["lr"]
@@ -233,7 +272,7 @@ def main_worker(args):
                 print(json.dumps(stats))
                 print(json.dumps(stats), file=stats_file)
 
-    def evaluate(epoch, model, val_loader, device, stats_file):
+    def evaluate(epoch, model, val_loader, device, stats_file, log_suffix=""):
         model.eval()
         top1 = AverageMeter("Acc@1")
         top3 = AverageMeter("Acc@3")
@@ -248,6 +287,7 @@ def main_worker(args):
         best_acc.top1 = max(best_acc.top1, top1.avg)
         best_acc.top3 = max(best_acc.top3, top3.avg)
         stats = dict(
+            log_suffix=log_suffix,
             epoch=epoch,
             acc1=top1.avg,
             acc3=top3.avg,
@@ -259,9 +299,11 @@ def main_worker(args):
 
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
-        train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file)
-        evaluate(epoch, model, val_loader, device, stats_file)
+        train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file, model_ema)
         scheduler.step()
+        evaluate(epoch, model, val_loader, device, stats_file)
+        if model_ema:
+            evaluate(epoch, model_ema, val_loader, device, stats_file, log_suffix="EMA")
 
         state = dict(
             epoch=epoch + 1,
@@ -270,6 +312,9 @@ def main_worker(args):
             optimizer=optimizer.state_dict(),
             scheduler=scheduler.state_dict(),
         )
+        if model_ema:
+            state["model_ema"] = model_ema.state_dict()
+        torch.save(state, args.exp_dir / f"model_epoch{epoch}.pth")
         torch.save(state, args.exp_dir / "checkpoint.pth")
 
 
