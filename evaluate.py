@@ -208,15 +208,8 @@ def main_worker(args):
         start_epoch = 0
         best_acc = argparse.Namespace(top1=0, top3=0)
 
-    start_time = time.time()
-    for epoch in range(start_epoch, args.epochs):
-        # train
-        if args.weights == "finetune":
-            model.train()
-        elif args.weights == "freeze":
-            model.eval()
-        else:
-            assert False
+    def train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file):
+        model.train()
         for step, (images, target) in enumerate(
             train_loader, start=epoch * len(train_loader)
         ):
@@ -240,7 +233,7 @@ def main_worker(args):
                 print(json.dumps(stats))
                 print(json.dumps(stats), file=stats_file)
 
-        # evaluate
+    def evaluate(epoch, model, val_loader, device, stats_file):
         model.eval()
         top1 = AverageMeter("Acc@1")
         top3 = AverageMeter("Acc@3")
@@ -264,6 +257,10 @@ def main_worker(args):
         print(json.dumps(stats))
         print(json.dumps(stats), file=stats_file)
 
+    start_time = time.time()
+    for epoch in range(start_epoch, args.epochs):
+        train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file)
+        evaluate(epoch, model, val_loader, device, stats_file)
         scheduler.step()
 
         state = dict(
