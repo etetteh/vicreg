@@ -10,18 +10,15 @@ from pathlib import Path
 import argparse
 import json
 import os
-import random
-import signal
 import sys
 import time
-import urllib
 
 from torch import nn, optim
 from torchvision import datasets, transforms
 import torch
 
 import resnet
-
+import create_subset
 
 def get_arguments():
     parser = argparse.ArgumentParser(
@@ -34,7 +31,7 @@ def get_arguments():
         "--train-percent",
         default=100,
         type=int,
-        choices=(100, 10, 1),
+        # choices="Any percent of user's choice",
         help="size of training set in percent",
     )
 
@@ -105,39 +102,20 @@ def get_arguments():
 def main():
     parser = get_arguments()
     args = parser.parse_args()
-    if args.train_percent in {1, 10}:
-        args.train_files = urllib.request.urlopen(
-            f"https://raw.githubusercontent.com/google-research/simclr/master/imagenet_subsets/{args.train_percent}percent.txt"
-        ).readlines()
-    args.ngpus_per_node = torch.cuda.device_count()
-    if "SLURM_JOB_ID" in os.environ:
-        signal.signal(signal.SIGUSR1, handle_sigusr1)
-        signal.signal(signal.SIGTERM, handle_sigterm)
-    # single-node distributed training
-    args.rank = 0
-    args.dist_url = f"tcp://localhost:{random.randrange(49152, 65535)}"
-    args.world_size = args.ngpus_per_node
-    torch.multiprocessing.spawn(main_worker, (args,), args.ngpus_per_node)
+    if args.train_percent != 100:
+        print(f"Performing semi-supervised learning with {args.train_percent}% labels")
+        create_subset.create_data_subset(dataset_path=args.data_dir, subset_percent=args.train_percent)
+        args.train_files = open(args.data_dir/"train_subset.txt", 'r').readlines()
+    main_worker(args)
 
 
-def main_worker(gpu, args):
-    args.rank += gpu
-    torch.distributed.init_process_group(
-        backend="nccl",
-        init_method=args.dist_url,
-        world_size=args.world_size,
-        rank=args.rank,
-    )
+def main_worker(args):
+    args.exp_dir.mkdir(parents=True, exist_ok=True)
+    stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
+    print(" ".join(sys.argv))
+    print(" ".join(sys.argv), file=stats_file)
 
-    if args.rank == 0:
-        args.exp_dir.mkdir(parents=True, exist_ok=True)
-        stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
-        print(" ".join(sys.argv))
-        print(" ".join(sys.argv), file=stats_file)
-
-    torch.cuda.set_device(gpu)
-    torch.backends.cudnn.benchmark = True
-
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # Data loading code
     traindir = args.data_dir / "train"
@@ -169,23 +147,22 @@ def main_worker(gpu, args):
         ),
     )
 
-    if args.train_percent in {1, 10}:
+    if args.train_percent != 100:
         train_dataset.samples = []
         for fname in args.train_files:
-            fname = fname.decode().strip()
+            fname = fname.strip()
             cls = fname.split("_")[0]
             train_dataset.samples.append(
                 (traindir / cls / fname, train_dataset.class_to_idx[cls])
             )
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     kwargs = dict(
-        batch_size=args.batch_size // args.world_size,
+        batch_size=args.batch_size,
         num_workers=args.workers,
         pin_memory=True,
     )
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, sampler=train_sampler, **kwargs
+        train_dataset, **kwargs
     )
     val_loader = torch.utils.data.DataLoader(val_dataset, **kwargs)
 
@@ -199,14 +176,13 @@ def main_worker(gpu, args):
     head.weight.data.normal_(mean=0.0, std=0.01)
     head.bias.data.zero_()
     model = nn.Sequential(backbone, head)
-    model.cuda(gpu)
+    model.to(device)
 
     if args.weights == "freeze":
         backbone.requires_grad_(False)
         head.requires_grad_(True)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
-    criterion = nn.CrossEntropyLoss().cuda(gpu)
+    criterion = nn.CrossEntropyLoss().to(device)
 
     param_groups = [dict(params=head.parameters(), lr=args.lr_head)]
     if args.weights == "finetune":
@@ -224,7 +200,7 @@ def main_worker(gpu, args):
         scheduler.load_state_dict(ckpt["scheduler"])
     else:
         start_epoch = 0
-        best_acc = argparse.Namespace(top1=0, top5=0)
+        best_acc = argparse.Namespace(top1=0, top3=0)
 
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
@@ -235,67 +211,63 @@ def main_worker(gpu, args):
             model.eval()
         else:
             assert False
-        train_sampler.set_epoch(epoch)
         for step, (images, target) in enumerate(
             train_loader, start=epoch * len(train_loader)
         ):
-            output = model(images.cuda(gpu, non_blocking=True))
-            loss = criterion(output, target.cuda(gpu, non_blocking=True))
+            output = model(images.to(device))
+            loss = criterion(output, target.to(device))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             if step % args.print_freq == 0:
-                torch.distributed.reduce(loss.div_(args.world_size), 0)
-                if args.rank == 0:
-                    pg = optimizer.param_groups
-                    lr_head = pg[0]["lr"]
-                    lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
-                    stats = dict(
-                        epoch=epoch,
-                        step=step,
-                        lr_backbone=lr_backbone,
-                        lr_head=lr_head,
-                        loss=loss.item(),
-                        time=int(time.time() - start_time),
-                    )
-                    print(json.dumps(stats))
-                    print(json.dumps(stats), file=stats_file)
+                pg = optimizer.param_groups
+                lr_head = pg[0]["lr"]
+                lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
+                stats = dict(
+                    epoch=epoch,
+                    step=step,
+                    lr_backbone=lr_backbone,
+                    lr_head=lr_head,
+                    loss=loss.item(),
+                    time=int(time.time() - start_time),
+                )
+                print(json.dumps(stats))
+                print(json.dumps(stats), file=stats_file)
 
         # evaluate
         model.eval()
-        if args.rank == 0:
-            top1 = AverageMeter("Acc@1")
-            top5 = AverageMeter("Acc@5")
-            with torch.no_grad():
-                for images, target in val_loader:
-                    output = model(images.cuda(gpu, non_blocking=True))
-                    acc1, acc5 = accuracy(
-                        output, target.cuda(gpu, non_blocking=True), topk=(1, 5)
-                    )
-                    top1.update(acc1[0].item(), images.size(0))
-                    top5.update(acc5[0].item(), images.size(0))
-            best_acc.top1 = max(best_acc.top1, top1.avg)
-            best_acc.top5 = max(best_acc.top5, top5.avg)
-            stats = dict(
-                epoch=epoch,
-                acc1=top1.avg,
-                acc5=top5.avg,
-                best_acc1=best_acc.top1,
-                best_acc5=best_acc.top5,
-            )
-            print(json.dumps(stats))
-            print(json.dumps(stats), file=stats_file)
+        top1 = AverageMeter("Acc@1")
+        top3 = AverageMeter("Acc@3")
+        with torch.no_grad():
+            for images, target in val_loader:
+                output = model(images.to(device))
+                acc1, acc3 = accuracy(
+                        output, target.to(device), topk=(1, 3)
+                )
+                top1.update(acc1[0].item(), images.size(0))
+                top3.update(acc3[0].item(), images.size(0))
+        best_acc.top1 = max(best_acc.top1, top1.avg)
+        best_acc.top3 = max(best_acc.top3, top3.avg)
+        stats = dict(
+            epoch=epoch,
+            acc1=top1.avg,
+            acc3=top3.avg,
+            best_acc1=best_acc.top1,
+            best_acc3=best_acc.top3,
+        )
+        print(json.dumps(stats))
+        print(json.dumps(stats), file=stats_file)
 
         scheduler.step()
-        if args.rank == 0:
-            state = dict(
-                epoch=epoch + 1,
-                best_acc=best_acc,
-                model=model.state_dict(),
-                optimizer=optimizer.state_dict(),
-                scheduler=scheduler.state_dict(),
-            )
-            torch.save(state, args.exp_dir / "checkpoint.pth")
+
+        state = dict(
+            epoch=epoch + 1,
+            best_acc=best_acc,
+            model=model.state_dict(),
+            optimizer=optimizer.state_dict(),
+            scheduler=scheduler.state_dict(),
+        )
+        torch.save(state, args.exp_dir / "checkpoint.pth")
 
 
 def handle_sigusr1(signum, frame):
