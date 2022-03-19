@@ -95,6 +95,13 @@ def get_arguments():
         help="number of data loader workers",
     )
 
+    parser.add_argument(
+        "--label-smoothing",
+        default=0.0,
+        type=float,
+        help="label smoothing (default: 0.0)",
+        dest="label_smoothing"
+    )
     return parser
 
 
@@ -181,7 +188,7 @@ def main_worker(args):
         backbone.requires_grad_(False)
         head.requires_grad_(True)
 
-    criterion = nn.CrossEntropyLoss().to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
 
     param_groups = [dict(params=head.parameters(), lr=args.lr_head)]
     if args.weights == "finetune":
