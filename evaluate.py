@@ -31,7 +31,6 @@ def get_arguments():
         "--train-percent",
         default=100,
         type=int,
-        # choices="Any percent of user's choice",
         help="size of training set in percent",
     )
 
