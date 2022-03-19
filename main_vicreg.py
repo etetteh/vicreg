@@ -16,13 +16,12 @@ import time
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
-import torch.distributed as dist
 import torchvision.datasets as datasets
 
 import augmentations as aug
-from distributed import init_distributed_mode
 
 import resnet
+from deit_models import deit
 
 
 def get_arguments():
@@ -63,49 +62,40 @@ def get_arguments():
                         help='Covariance regularization loss coefficient')
 
     # Running
-    parser.add_argument("--num-workers", type=int, default=10)
-    parser.add_argument('--device', default='cuda',
-                        help='device to use for training / testing')
-
-    # Distributed
-    parser.add_argument('--world-size', default=1, type=int,
-                        help='number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
-    parser.add_argument('--dist-url', default='env://',
-                        help='url used to set up distributed training')
+    parser.add_argument("--num-workers", type=int, default=8)
 
     return parser
 
 
 def main(args):
-    torch.backends.cudnn.benchmark = True
-    init_distributed_mode(args)
     print(args)
-    gpu = torch.device(args.device)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    if args.rank == 0:
-        args.exp_dir.mkdir(parents=True, exist_ok=True)
-        stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
-        print(" ".join(sys.argv))
-        print(" ".join(sys.argv), file=stats_file)
+    args.exp_dir.mkdir(parents=True, exist_ok=True)
+    stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
+    print(" ".join(sys.argv))
+    print(" ".join(sys.argv), file=stats_file)
 
     transforms = aug.TrainTransform()
 
     dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
-    assert args.batch_size % args.world_size == 0
-    per_device_batch_size = args.batch_size // args.world_size
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=per_device_batch_size,
+        batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
-        sampler=sampler,
     )
 
-    model = VICReg(args).cuda(gpu)
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+    if 'deit' in args.arch:
+        backbone, embedding = deit(args.arch)
+        norm_shape = backbone[2][0].norm1.normalized_shape[0]
+        args.mlp = "{norm}-{norm}-{norm}".format(norm=norm_shape)
+    else:
+        backbone, embedding = resnet.__dict__[args.arch](
+            zero_init_residual=True
+        )
+
+    model = VICReg(args, backbone, embedding).to(device)
     optimizer = LARS(
         model.parameters(),
         lr=0,
@@ -115,8 +105,7 @@ def main(args):
     )
 
     if (args.exp_dir / "model.pth").is_file():
-        if args.rank == 0:
-            print("resuming from checkpoint")
+        print("resuming from checkpoint")
         ckpt = torch.load(args.exp_dir / "model.pth", map_location="cpu")
         start_epoch = ckpt["epoch"]
         model.load_state_dict(ckpt["model"])
@@ -125,24 +114,20 @@ def main(args):
         start_epoch = 0
 
     start_time = last_logging = time.time()
-    scaler = torch.cuda.amp.GradScaler()
     for epoch in range(start_epoch, args.epochs):
-        sampler.set_epoch(epoch)
         for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
-            x = x.cuda(gpu, non_blocking=True)
-            y = y.cuda(gpu, non_blocking=True)
+            x = x.to(device)
+            y = y.to(device)
 
             lr = adjust_learning_rate(args, optimizer, loader, step)
 
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
-                loss = model.forward(x, y)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss = model.forward(x, y)
+            loss.backward()
+            optimizer.step()
 
             current_time = time.time()
-            if args.rank == 0 and current_time - last_logging > args.log_freq_time:
+            if current_time - last_logging > args.log_freq_time:
                 stats = dict(
                     epoch=epoch,
                     step=step,
@@ -153,15 +138,15 @@ def main(args):
                 print(json.dumps(stats))
                 print(json.dumps(stats), file=stats_file)
                 last_logging = current_time
-        if args.rank == 0:
-            state = dict(
-                epoch=epoch + 1,
-                model=model.state_dict(),
-                optimizer=optimizer.state_dict(),
-            )
-            torch.save(state, args.exp_dir / "model.pth")
-    if args.rank == 0:
-        torch.save(model.module.backbone.state_dict(), args.exp_dir / "resnet50.pth")
+
+        state = dict(
+            epoch=epoch + 1,
+            model=model.state_dict(),
+            optimizer=optimizer.state_dict(),
+        )
+        torch.save(state, args.exp_dir / "model.pth")
+
+    torch.save(model.backbone.state_dict(), args.exp_dir / "resnet50.pth")
 
 
 def adjust_learning_rate(args, optimizer, loader, step):
@@ -182,13 +167,12 @@ def adjust_learning_rate(args, optimizer, loader, step):
 
 
 class VICReg(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, backbone, embedding):
         super().__init__()
         self.args = args
         self.num_features = int(args.mlp.split("-")[-1])
-        self.backbone, self.embedding = resnet.__dict__[args.arch](
-            zero_init_residual=True
-        )
+        self.backbone = backbone
+        self.embedding = embedding
         self.projector = Projector(args, self.embedding)
 
     def forward(self, x, y):
@@ -197,8 +181,6 @@ class VICReg(nn.Module):
 
         repr_loss = F.mse_loss(x, y)
 
-        x = torch.cat(FullGatherLayer.apply(x), dim=0)
-        y = torch.cat(FullGatherLayer.apply(y), dim=0)
         x = x - x.mean(dim=0)
         y = y - y.mean(dim=0)
 
@@ -302,25 +284,6 @@ class LARS(optim.Optimizer):
 def batch_all_gather(x):
     x_list = FullGatherLayer.apply(x)
     return torch.cat(x_list, dim=0)
-
-
-class FullGatherLayer(torch.autograd.Function):
-    """
-    Gather tensors from all process and support backward propagation
-    for the gradients across processes.
-    """
-
-    @staticmethod
-    def forward(ctx, x):
-        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
-        dist.all_gather(output, x)
-        return tuple(output)
-
-    @staticmethod
-    def backward(ctx, *grads):
-        all_gradients = torch.stack(grads)
-        dist.all_reduce(all_gradients)
-        return all_gradients[dist.get_rank()]
 
 
 def handle_sigusr1(signum, frame):
