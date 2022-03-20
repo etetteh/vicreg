@@ -14,6 +14,7 @@ import sys
 import time
 
 import torch
+import torchvision
 import torch.nn.functional as F
 from torch import nn, optim
 import torchvision.datasets as datasets
@@ -52,6 +53,10 @@ def get_arguments():
                         help='Base learning rate, effective learning after warmup is [base-lr] * [batch-size] / 256')
     parser.add_argument("--wd", type=float, default=1e-6,
                         help='Weight decay')
+    parser.add_argument("--norm-weight-decay",
+                        default=None,
+                        type=float,
+                        help="weight decay for Normalization layers (default: None, same value as --wd)",)
 
     # Loss
     parser.add_argument("--sim-coeff", type=float, default=25.0,
@@ -96,8 +101,16 @@ def main(args):
         )
 
     model = VICReg(args, backbone, embedding).to(device)
+
+    if args.norm_weight_decay is None:
+        parameters = model.parameters()
+    else:
+        param_groups = torchvision.ops._utils.split_normalization_params(model)
+        wd_groups = [args.norm_weight_decay, args.wd]
+        parameters = [{"params": p, "weight_decay": w} for p, w in zip(param_groups, wd_groups) if p]
+
     optimizer = LARS(
-        model.parameters(),
+        parameters,
         lr=0,
         weight_decay=args.wd,
         weight_decay_filter=exclude_bias_and_norm,
