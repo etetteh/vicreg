@@ -55,7 +55,7 @@ def create_data_subset(dataset_path: str, subset_percent: int):
             images_list.append(os.path.basename(image))
 
     # save images names in the list to .txt file
-    with open(os.path.join(dataset_path, 'train_subset.txt'), 'w') as f:
+    with open(os.path.join(dataset_path, f'{subset_percent}percent_train_subset.txt'), 'w') as f:
         for item in images_list:
             f.write(item + "\n")
 
