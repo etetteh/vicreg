@@ -45,7 +45,7 @@ def get_arguments():
         help="path to checkpoint directory",
     )
     parser.add_argument(
-        "--print-freq", default=100, type=int, metavar="N", help="print frequency"
+        "--print-freq", default=10, type=int, metavar="N", help="print frequency"
     )
 
     # Model
@@ -139,9 +139,13 @@ def main():
     parser = get_arguments()
     args = parser.parse_args()
     if args.train_percent != 100:
-        print(f"Performing semi-supervised learning with {args.train_percent}% labels")
-        create_subset.create_data_subset(dataset_path=args.data_dir, subset_percent=args.train_percent)
-        args.train_files = open(args.data_dir/"train_subset.txt", 'r').readlines()
+        if (args.data_dir / f'{args.train_percent}percent_train_subset.txt').is_file():
+            print(f"Loading {args.train_percent} percent train subset images names...")
+            args.train_files = open(args.data_dir/f'{args.train_percent}percent_train_subset.txt', 'r').readlines()
+        else:
+            print(f"Creating {args.train_percent} percent train subset images names...")
+            create_subset.create_data_subset(dataset_path=args.data_dir, subset_percent=args.train_percent)
+            args.train_files = open(args.data_dir/f'{args.train_percent}percent_train_subset.txt', 'r').readlines()
     main_worker(args)
 
 
@@ -223,8 +227,10 @@ def main_worker(args):
     param_groups = [dict(params=head.parameters(), lr=args.lr_head)]
     if args.weights == "finetune":
         param_groups.append(dict(params=backbone.parameters(), lr=args.lr_backbone))
+
     optimizer = optim.SGD(param_groups, 0, momentum=0.9, weight_decay=args.weight_decay)
     main_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs - args.lr_warmup_epochs)
+
     if args.lr_warmup_epochs > 0:
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
                 optimizer, start_factor=args.lr_warmup_decay, total_iters=args.lr_warmup_epochs
@@ -252,6 +258,7 @@ def main_worker(args):
         scheduler.load_state_dict(ckpt["scheduler"])
         if model_ema:
             model_ema.load_state_dict(ckpt["model_ema"])
+        print(f"Resume training from epoch {start_epoch}...")
     else:
         start_epoch = 0
         best_acc = argparse.Namespace(top1=0, top3=0)
@@ -287,7 +294,7 @@ def main_worker(args):
                 print(json.dumps(stats))
                 print(json.dumps(stats), file=stats_file)
 
-    def evaluate(epoch, model, val_loader, device, stats_file, log_suffix=""):
+    def evaluate(epoch, model, val_loader, device, stats_file, log_suffix):
         model.eval()
         top1 = AverageMeter("Acc@1")
         top3 = AverageMeter("Acc@3")
@@ -299,16 +306,24 @@ def main_worker(args):
                 )
                 top1.update(acc1[0].item(), images.size(0))
                 top3.update(acc3[0].item(), images.size(0))
-        best_acc.top1 = max(best_acc.top1, top1.avg)
-        best_acc.top3 = max(best_acc.top3, top3.avg)
+
+        if top1.avg > best_acc.top1:
+            print(f"acc1 improved. Saving model state... ")
+            best_acc.top1 = max(best_acc.top1, top1.avg)
+            best_acc.top3 = max(best_acc.top3, top3.avg)
+            best_model_state = model.state_dict()
+            torch.save(best_model_state, args.exp_dir / f"best_model_epoch{epoch}.pth")
+
         stats = dict(
-            log_suffix=log_suffix,
             epoch=epoch,
             acc1=top1.avg,
             acc3=top3.avg,
             best_acc1=best_acc.top1,
             best_acc3=best_acc.top3,
         )
+        if log_suffix is not None:
+            stats["log_suffix"] = log_suffix
+
         print(json.dumps(stats))
         print(json.dumps(stats), file=stats_file)
 
@@ -329,7 +344,6 @@ def main_worker(args):
         )
         if model_ema:
             state["model_ema"] = model_ema.state_dict()
-        torch.save(state, args.exp_dir / f"model_epoch{epoch}.pth")
         torch.save(state, args.exp_dir / "checkpoint.pth")
 
 
