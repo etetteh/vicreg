@@ -92,6 +92,12 @@ def get_arguments():
         type=int,
         help="the number of epochs to warmup (default: 0)"
     )
+    parser.add_argument(
+        "--lr-warmup-decay",
+        default=0.01,
+        type=float,
+        help="the decay for lr"
+    )
     # Running
     parser.add_argument(
         "--workers",
@@ -218,7 +224,16 @@ def main_worker(args):
     if args.weights == "finetune":
         param_groups.append(dict(params=backbone.parameters(), lr=args.lr_backbone))
     optimizer = optim.SGD(param_groups, 0, momentum=0.9, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
+    main_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs - args.lr_warmup_epochs)
+    if args.lr_warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=args.lr_warmup_decay, total_iters=args.lr_warmup_epochs
+            )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[args.lr_warmup_epochs]
+        )
+    else:
+        scheduler = main_scheduler
 
     model_ema = None
     if args.model_ema:
