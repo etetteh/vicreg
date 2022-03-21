@@ -15,17 +15,22 @@ import time
 
 from torch import nn, optim
 from torchvision import datasets, transforms
+from torchvision.transforms import autoaugment
+from torchvision.transforms.functional import InterpolationMode
 import torch
 
 import utils
 import resnet
 import create_subset
+from randoms import set_seed
 
 def get_arguments():
     parser = argparse.ArgumentParser(
-        description="Evaluate a pretrained model on ImageNet"
+        description="Evaluate a pretrained model"
     )
-
+    parser.add_argument(
+        "--seed", default=7, type=int, help="seed for reproducibility"
+    )
     # Data
     parser.add_argument("--data-dir", type=Path, help="path to dataset")
     parser.add_argument(
@@ -132,6 +137,8 @@ def get_arguments():
         default=0.99998,
         help="decay factor for Exponential Moving Average of model parameters (default: 0.99998)",
     )
+    # Data Augmentation
+    parser.add_argument("--data-augment", default=None, type=str, choices={"trivial", "rand"}, help="auto augment policy (default: None)")
     return parser
 
 
@@ -150,6 +157,7 @@ def main():
 
 
 def main_worker(args):
+    set_seed(args.seed)
     args.exp_dir.mkdir(parents=True, exist_ok=True)
     stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
     print(" ".join(sys.argv))
@@ -164,17 +172,21 @@ def main_worker(args):
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     )
 
+    train_transforms = [transforms.RandomResizedCrop(224, interpolation=InterpolationMode.BILINEAR), transforms.RandomHorizontalFlip()]
+    if args.data_augment == "trivial":
+        train_transforms.append(autoaugment.TrivialAugmentWide(interpolation=InterpolationMode.BILINEAR))
+    elif args.data_augment == "rand":
+        train_transforms.append(autoaugment.RandAugment(interpolation=InterpolationMode.BILINEAR))
+    train_transforms.extend([
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
     train_dataset = datasets.ImageFolder(
         traindir,
-        transforms.Compose(
-            [
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]
-        ),
+        transforms.Compose(train_transforms)
     )
+
     val_dataset = datasets.ImageFolder(
         valdir,
         transforms.Compose(
@@ -294,7 +306,7 @@ def main_worker(args):
                 print(json.dumps(stats))
                 print(json.dumps(stats), file=stats_file)
 
-    def evaluate(epoch, model, val_loader, device, stats_file, log_suffix):
+    def evaluate(epoch, model, val_loader, device, stats_file, log_suffix=""):
         model.eval()
         top1 = AverageMeter("Acc@1")
         top3 = AverageMeter("Acc@3")
@@ -308,21 +320,20 @@ def main_worker(args):
                 top3.update(acc3[0].item(), images.size(0))
 
         if top1.avg > best_acc.top1:
-            print(f"acc1 improved. Saving model state... ")
+            print(f"acc1 improved from {best_acc.top1:4f} to {top1.avg:4f}. Saving model state... ")
             best_acc.top1 = max(best_acc.top1, top1.avg)
             best_acc.top3 = max(best_acc.top3, top3.avg)
             best_model_state = model.state_dict()
             torch.save(best_model_state, args.exp_dir / f"best_model_epoch{epoch}.pth")
 
         stats = dict(
+            log_suffix=log_suffix,
             epoch=epoch,
             acc1=top1.avg,
             acc3=top3.avg,
             best_acc1=best_acc.top1,
             best_acc3=best_acc.top3,
         )
-        if log_suffix is not None:
-            stats["log_suffix"] = log_suffix
 
         print(json.dumps(stats))
         print(json.dumps(stats), file=stats_file)
@@ -345,6 +356,8 @@ def main_worker(args):
         if model_ema:
             state["model_ema"] = model_ema.state_dict()
         torch.save(state, args.exp_dir / "checkpoint.pth")
+
+    print(argparse.Namespace)
 
 
 def handle_sigusr1(signum, frame):
