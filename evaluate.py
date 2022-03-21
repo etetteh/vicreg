@@ -139,6 +139,8 @@ def get_arguments():
     )
     # Data Augmentation
     parser.add_argument("--data-augment", default=None, type=str, choices={"trivial", "rand"}, help="auto augment policy (default: None)")
+
+    parser.add_argument("--random-erase", default=0.0, type=float, help="random erasing probability (default: 0.0)")
     return parser
 
 
@@ -157,7 +159,7 @@ def main():
 
 
 def main_worker(args):
-    set_seed(args.seed)
+    # set_seed(args.seed)
     args.exp_dir.mkdir(parents=True, exist_ok=True)
     stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
     print(" ".join(sys.argv))
@@ -177,11 +179,16 @@ def main_worker(args):
         train_transforms.append(autoaugment.TrivialAugmentWide(interpolation=InterpolationMode.BILINEAR))
     elif args.data_augment == "rand":
         train_transforms.append(autoaugment.RandAugment(interpolation=InterpolationMode.BILINEAR))
+
     train_transforms.extend([
-            transforms.ToTensor(),
+            transforms.PILToTensor(),
+            transforms.ConvertImageDtype(torch.float),
             normalize,
         ]
     )
+    if args.random_erase > 0:
+        train_transforms.append(transforms.RandomErasing(p=args.random_erase))
+
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose(train_transforms)
@@ -193,7 +200,8 @@ def main_worker(args):
             [
                 transforms.Resize(256),
                 transforms.CenterCrop(224),
-                transforms.ToTensor(),
+                transforms.PILToTensor(),
+                transforms.ConvertImageDtype(torch.float),
                 normalize,
             ]
         ),
@@ -356,8 +364,6 @@ def main_worker(args):
         if model_ema:
             state["model_ema"] = model_ema.state_dict()
         torch.save(state, args.exp_dir / "checkpoint.pth")
-
-    print(argparse.Namespace)
 
 
 def handle_sigusr1(signum, frame):
