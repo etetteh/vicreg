@@ -65,7 +65,7 @@ def get_arguments():
         help="number of total epochs to run",
     )
     parser.add_argument(
-        "--batch-size", default=256, type=int, metavar="N", help="mini-batch size"
+        "--batch-size", default=128, type=int, metavar="N", help="mini-batch size"
     )
     parser.add_argument(
         "--lr-backbone",
@@ -95,7 +95,7 @@ def get_arguments():
         "--lr-warmup-epochs",
         default=0,
         type=int,
-        help="the number of epochs to warmup (default: 0)"
+        help="the number of epochs to warmup"
     )
     parser.add_argument(
         "--lr-warmup-decay",
@@ -116,31 +116,40 @@ def get_arguments():
         "--label-smoothing",
         default=0.0,
         type=float,
-        help="label smoothing (default: 0.0)",
+        help="label smoothing",
         dest="label_smoothing"
     )
     # EMA
     parser.add_argument(
         "--model-ema",
         action="store_true",
-        help="enable tracking Exponential Moving Average of model parameters"
+        help="enable Exponential Moving Average of model parameters"
     )
     parser.add_argument(
         "--model-ema-steps",
         type=int,
         default=32,
-        help="the number of iterations that controls how often to update the EMA model (default: 32)",
+        help="number of iterations for updating EMA model",
     )
     parser.add_argument(
         "--model-ema-decay",
         type=float,
         default=0.99998,
-        help="decay factor for Exponential Moving Average of model parameters (default: 0.99998)",
+        help="Exponential Moving Average decay factor"
     )
     # Data Augmentation
-    parser.add_argument("--data-augment", default=None, type=str, choices={"trivial", "rand"}, help="auto augment policy (default: None)")
+    parser.add_argument(
+        "--val-resize", default=256, type=int, help="validation data resize size"
+    )
+    parser.add_argument(
+        "--val-crop", default=224, type=int, help="validation data centre crop size"
+    )
+    parser.add_argument(
+        "--train-crop", default=224, type=int, help="training data random crop size"
+    )
+    parser.add_argument("--auto-augment", default=None, type=str, choices=("trivial", "rand"), help="auto augment policy")
 
-    parser.add_argument("--random-erase", default=0.0, type=float, help="random erasing probability (default: 0.0)")
+    parser.add_argument("--random-erase", default=0.0, type=float, help="random erasing probability")
     return parser
 
 
@@ -159,7 +168,7 @@ def main():
 
 
 def main_worker(args):
-    # set_seed(args.seed)
+    set_seed(args.seed)
     args.exp_dir.mkdir(parents=True, exist_ok=True)
     stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
     print(" ".join(sys.argv))
@@ -174,10 +183,13 @@ def main_worker(args):
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     )
 
-    train_transforms = [transforms.RandomResizedCrop(224, interpolation=InterpolationMode.BILINEAR), transforms.RandomHorizontalFlip()]
-    if args.data_augment == "trivial":
+    train_transforms = [
+            transforms.RandomResizedCrop(args.train_crop, interpolation=InterpolationMode.BILINEAR),
+            transforms.RandomHorizontalFlip()
+    ]
+    if args.auto_augment == "trivial":
         train_transforms.append(autoaugment.TrivialAugmentWide(interpolation=InterpolationMode.BILINEAR))
-    elif args.data_augment == "rand":
+    elif args.auto_augment == "rand":
         train_transforms.append(autoaugment.RandAugment(interpolation=InterpolationMode.BILINEAR))
 
     train_transforms.extend([
@@ -198,8 +210,8 @@ def main_worker(args):
         valdir,
         transforms.Compose(
             [
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
+                transforms.Resize(args.val_resize),
+                transforms.CenterCrop(args.val_crop),
                 transforms.PILToTensor(),
                 transforms.ConvertImageDtype(torch.float),
                 normalize,
@@ -331,7 +343,7 @@ def main_worker(args):
                 top3.update(acc3[0].item(), images.size(0))
 
         if top1.avg > best_acc.top1:
-            print(f"acc1 improved from {best_acc.top1:.4f} to {top1.avg:.4f}. Saving model state... ")
+            print(f"Acc@1 improved from {best_acc.top1:.3f}% to {top1.avg:.3f}%. Saving model state... ")
             best_acc.top1 = max(best_acc.top1, top1.avg)
             best_acc.top3 = max(best_acc.top3, top3.avg)
             best_model_state = model.state_dict()
