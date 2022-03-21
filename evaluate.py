@@ -216,15 +216,18 @@ def main_worker(args):
                 (traindir / cls / fname, train_dataset.class_to_idx[cls])
             )
 
+    train_sampler = torch.utils.data.RandomSampler(train_dataset)
+    val_sampler = torch.utils.data.SequentialSampler(val_dataset)
+
     kwargs = dict(
         batch_size=args.batch_size,
         num_workers=args.workers,
         pin_memory=True,
     )
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, **kwargs
+        train_dataset, sampler=train_sampler, **kwargs
     )
-    val_loader = torch.utils.data.DataLoader(val_dataset, **kwargs)
+    val_loader = torch.utils.data.DataLoader(val_dataset, sampler=val_sampler, **kwargs)
 
     # Model definition and loading
     backbone, embedding = resnet.__dict__[args.arch](zero_init_residual=True)
@@ -328,7 +331,7 @@ def main_worker(args):
                 top3.update(acc3[0].item(), images.size(0))
 
         if top1.avg > best_acc.top1:
-            print(f"acc1 improved from {best_acc.top1:4f} to {top1.avg:4f}. Saving model state... ")
+            print(f"acc1 improved from {best_acc.top1:.4f} to {top1.avg:.4f}. Saving model state... ")
             best_acc.top1 = max(best_acc.top1, top1.avg)
             best_acc.top3 = max(best_acc.top3, top3.avg)
             best_model_state = model.state_dict()
