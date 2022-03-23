@@ -300,6 +300,7 @@ def main_worker(args):
 
     def train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file, model_ema=None,):
         model.train()
+        start_time = time.time()
         for step, (images, target) in enumerate(
             train_loader, start=epoch * len(train_loader)
         ):
@@ -324,7 +325,7 @@ def main_worker(args):
                     lr_backbone=lr_backbone,
                     lr_head=lr_head,
                     loss=loss.item(),
-                    time=int(time.time() - start_time),
+                    time=time.strftime("%M:%S", time.gmtime(int(time.time() - start_time))),
                 )
                 print(json.dumps(stats))
                 print(json.dumps(stats), file=stats_file)
@@ -361,7 +362,6 @@ def main_worker(args):
         print(json.dumps(stats))
         print(json.dumps(stats), file=stats_file)
 
-    start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
         train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file, model_ema)
         scheduler.step()
