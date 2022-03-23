@@ -21,13 +21,18 @@ import torchvision.datasets as datasets
 
 import augmentations as aug
 
+import utils
 import resnet
 from deit_models import deit
+from randoms import set_seed
 
 
 def get_arguments():
     parser = argparse.ArgumentParser(description="Pretrain a resnet model with VICReg", add_help=False)
 
+    parser.add_argument(
+        "--seed", default=7, type=int, help="seed for reproducibility"
+    )
     # Data
     parser.add_argument("--data-dir", type=Path, default="/path/to/imagenet", required=True,
                         help='Path to the image net dataset')
@@ -57,6 +62,15 @@ def get_arguments():
                         default=None,
                         type=float,
                         help="weight decay for Normalization layers (default: None, same value as --wd)",)
+    parser.add_argument("--lr-warmup-epochs", default=0, type=int,
+                        help="the number of epochs to warmup")
+    # EMA
+    parser.add_argument("--model-ema", action="store_true",
+                        help="enable Exponential Moving Average of model parameters")
+    parser.add_argument("--model-ema-steps", type=int, default=32,
+                        help="number of iterations for updating EMA model",)
+    parser.add_argument("--model-ema-decay", type=float, default=0.99998,
+                        help="Exponential Moving Average decay factor")
 
     # Loss
     parser.add_argument("--sim-coeff", type=float, default=25.0,
@@ -74,6 +88,7 @@ def get_arguments():
 
 def main(args):
     print(args)
+    set_seed(args.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     args.exp_dir.mkdir(parents=True, exist_ok=True)
@@ -117,17 +132,27 @@ def main(args):
         lars_adaptation_filter=exclude_bias_and_norm,
     )
 
+    model_ema = None
+    if args.model_ema:
+        adjust = args.batch_size * args.model_ema_steps / args.epochs
+        alpha = 1.0 - args.model_ema_decay
+        alpha = min(1.0, alpha * adjust)
+        model_ema = utils.ExponentialMovingAverage(model, device=device, decay=1.0 - alpha)
+
     if (args.exp_dir / "model.pth").is_file():
-        print("resuming from checkpoint")
         ckpt = torch.load(args.exp_dir / "model.pth", map_location="cpu")
         start_epoch = ckpt["epoch"]
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        if model_ema:
+            model_ema.load_state_dict(ckpt["model_ema"])
+        print(f"Resuming from epoch {start_epoch}...")
     else:
         start_epoch = 0
 
-    start_time = last_logging = time.time()
-    for epoch in range(start_epoch, args.epochs):
+    def train_one_epoch(args, epoch, model, loader, device, optimizer, stats_file, model_ema=None):
+        model.train()
+        start_time = last_logging = time.time()
         for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
             x = x.to(device)
             y = y.to(device)
@@ -139,24 +164,35 @@ def main(args):
             loss.backward()
             optimizer.step()
 
+            if model_ema and step % args.model_ema_steps == 0:
+                print(f"Updating EMA model params")
+                model_ema.update_parameters(model)
+                if epoch < args.lr_warmup_epochs:
+                    model_ema.n_averaged.fill_(0)
+
             current_time = time.time()
             if current_time - last_logging > args.log_freq_time:
                 stats = dict(
                     epoch=epoch,
                     step=step,
                     loss=loss.item(),
-                    time=int(current_time - start_time),
+                    time=time.strftime("%M:%S", time.gmtime(int(current_time - start_time))),
                     lr=lr,
                 )
                 print(json.dumps(stats))
                 print(json.dumps(stats), file=stats_file)
                 last_logging = current_time
 
+    for epoch in range(start_epoch, args.epochs):
+        train_one_epoch(args, epoch, model, loader, device, optimizer, stats_file, model_ema)
+
         state = dict(
             epoch=epoch + 1,
             model=model.state_dict(),
             optimizer=optimizer.state_dict(),
         )
+        if model_ema:
+            state["model_ema"] = model_ema.state_dict()
         torch.save(state, args.exp_dir / "model.pth")
 
     torch.save(model.backbone.state_dict(), args.exp_dir / "resnet50.pth")
