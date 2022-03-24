@@ -10,8 +10,6 @@ from pathlib import Path
 import argparse
 import json
 import os
-import random
-import signal
 import sys
 import time
 
@@ -24,7 +22,6 @@ import torch
 import utils
 import resnet
 import create_subset
-from sampler import RASampler
 from randoms import set_seed
 
 def get_arguments():
@@ -68,7 +65,7 @@ def get_arguments():
         help="number of total epochs to run",
     )
     parser.add_argument(
-        "--batch-size", default=256, type=int, metavar="N", help="mini-batch size"
+        "--batch-size", default=128, type=int, metavar="N", help="mini-batch size"
     )
     parser.add_argument(
         "--lr-backbone",
@@ -153,12 +150,6 @@ def get_arguments():
     parser.add_argument("--auto-augment", default=None, type=str, choices=("trivial", "rand"), help="auto augment policy")
 
     parser.add_argument("--random-erase", default=0.0, type=float, help="random erasing probability")
-
-    # Repeated Augmentation
-    parser.add_argument("--ra-sampler", action="store_true", help="whether to use Repeated Augmentation in training")
-    parser.add_argument(
-        "--ra-reps", default=3, type=int, help="number of repetitions for Repeated Augmentation (default: 3)"
-    )
     return parser
 
 
@@ -173,36 +164,17 @@ def main():
             print(f"Creating {args.train_percent} percent train subset images names...")
             create_subset.create_data_subset(dataset_path=args.data_dir, subset_percent=args.train_percent)
             args.train_files = open(args.data_dir/f'{args.train_percent}percent_train_subset.txt', 'r').readlines()
-
-    args.ngpus_per_node = torch.cuda.device_count()
-    if "SLURM_JOB_ID" in os.environ:
-        signal.signal(signal.SIGUSR1, handle_sigusr1)
-        signal.signal(signal.SIGTERM, handle_sigterm)
-    # single-node distributed training
-    args.rank = 0
-    args.dist_url = f"tcp://localhost:{random.randrange(49152, 65535)}"
-    args.world_size = args.ngpus_per_node
-    torch.multiprocessing.spawn(main_worker, (args,), args.ngpus_per_node)
+    main_worker(args)
 
 
-def main_worker(gpu, args):
+def main_worker(args):
     set_seed(args.seed)
-    args.rank += gpu
-    torch.distributed.init_process_group(
-        backend="nccl",
-        init_method=args.dist_url,
-        world_size=args.world_size,
-        rank=args.rank,
-    )
+    args.exp_dir.mkdir(parents=True, exist_ok=True)
+    stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
+    print(" ".join(sys.argv))
+    print(" ".join(sys.argv), file=stats_file)
 
-    if args.rank == 0:
-        args.exp_dir.mkdir(parents=True, exist_ok=True)
-        stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
-        print(" ".join(sys.argv))
-        print(" ".join(sys.argv), file=stats_file)
-
-    torch.cuda.set_device(gpu)
-    torch.backends.cudnn.benchmark = True
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # Data loading code
     traindir = args.data_dir / "train"
@@ -256,14 +228,11 @@ def main_worker(gpu, args):
                 (traindir / cls / fname, train_dataset.class_to_idx[cls])
             )
 
-    if hasattr(args, "ra_sampler") and args.ra_sampler:
-        train_sampler = RASampler(train_dataset, shuffle=True, repetitions=args.ra_reps)
-    else:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
+    train_sampler = torch.utils.data.RandomSampler(train_dataset)
+    val_sampler = torch.utils.data.SequentialSampler(val_dataset)
 
     kwargs = dict(
-        batch_size=args.batch_size // args.world_size,
+        batch_size=args.batch_size,
         num_workers=args.workers,
         pin_memory=True,
     )
@@ -282,14 +251,13 @@ def main_worker(gpu, args):
     head.weight.data.normal_(mean=0.0, std=0.01)
     head.bias.data.zero_()
     model = nn.Sequential(backbone, head)
-    model.cuda(gpu)
+    model.to(device)
 
     if args.weights == "freeze":
         backbone.requires_grad_(False)
         head.requires_grad_(True)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(gpu)
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
 
     param_groups = [dict(params=head.parameters(), lr=args.lr_head)]
     if args.weights == "finetune":
@@ -325,12 +293,12 @@ def main_worker(gpu, args):
         scheduler.load_state_dict(ckpt["scheduler"])
         if model_ema:
             model_ema.load_state_dict(ckpt["model_ema"])
-        print(f"Resuming from epoch {start_epoch}...")
+        print(f"Resume training from epoch {start_epoch}...")
     else:
         start_epoch = 0
         best_acc = argparse.Namespace(top1=0, top3=0)
 
-    def train_one_epoch(args, epoch, model, train_loader, criterion, optimizer, stats_file, model_ema=None,):
+    def train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file, model_ema=None,):
         if args.weights == "finetune":
             model.train()
         elif args.weights == "freeze":
@@ -341,8 +309,8 @@ def main_worker(gpu, args):
         for step, (images, target) in enumerate(
             train_loader, start=epoch * len(train_loader)
         ):
-            output = model(images.cuda(gpu, non_blocking=True))
-            loss = criterion(output, target.cuda(gpu, non_blocking=True))
+            output = model(images.to(device))
+            loss = criterion(output, target.to(device))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -353,74 +321,69 @@ def main_worker(gpu, args):
                     model_ema.n_averaged.fill_(0)
 
             if step % args.print_freq == 0:
-                torch.distributed.reduce(loss.div_(args.world_size), 0)
-                if args.rank == 0:
-                    pg = optimizer.param_groups
-                    lr_head = pg[0]["lr"]
-                    lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
-                    stats = dict(
-                        epoch=epoch,
-                        step=step,
-                        lr_backbone=lr_backbone,
-                        lr_head=lr_head,
-                        loss=loss.item(),
-                        time=time.strftime("%M:%S", time.gmtime(int(time.time() - start_time))),
-                    )
-                    print(json.dumps(stats))
-                    print(json.dumps(stats), file=stats_file)
+                pg = optimizer.param_groups
+                lr_head = pg[0]["lr"]
+                lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
+                stats = dict(
+                    epoch=epoch,
+                    step=step,
+                    lr_backbone=lr_backbone,
+                    lr_head=lr_head,
+                    loss=loss.item(),
+                    time=time.strftime("%M:%S", time.gmtime(int(time.time() - start_time))),
+                )
+                print(json.dumps(stats))
+                print(json.dumps(stats), file=stats_file)
 
-    def evaluate(epoch, model, val_loader, stats_file, log_suffix=""):
+    def evaluate(epoch, model, val_loader, device, stats_file, log_suffix=""):
         model.eval()
-        if args.rank == 0:
-            top1 = AverageMeter("Acc@1")
-            top3 = AverageMeter("Acc@3")
-            with torch.no_grad():
-                for images, target in val_loader:
-                    output = model(images.cuda(gpu, non_blocking=True))
-                    acc1, acc3 = accuracy(
-                        output, target.cuda(gpu, non_blocking=True), topk=(1, 3)
+        top1 = AverageMeter("Acc@1")
+        top3 = AverageMeter("Acc@3")
+        with torch.no_grad():
+            for images, target in val_loader:
+                output = model(images.to(device))
+                acc1, acc3 = accuracy(
+                        output, target.to(device), topk=(1, 3)
                 )
                 top1.update(acc1[0].item(), images.size(0))
                 top3.update(acc3[0].item(), images.size(0))
 
-            if top1.avg > best_acc.top1:
-                print(f"Acc@1 improved from {best_acc.top1:.3f}% to {top1.avg:.3f}%. Saving model state... ")
-                best_acc.top1 = max(best_acc.top1, top1.avg)
-                best_acc.top3 = max(best_acc.top3, top3.avg)
-                best_model_state = model.state_dict()
-                torch.save(best_model_state, args.exp_dir / f"best_model_epoch{epoch}.pth")
+        if top1.avg > best_acc.top1:
+            print(f"Acc@1 improved from {best_acc.top1:.3f}% to {top1.avg:.3f}%. Saving model state... ")
+            best_acc.top1 = max(best_acc.top1, top1.avg)
+            best_acc.top3 = max(best_acc.top3, top3.avg)
+            best_model_state = model.state_dict()
+            torch.save(best_model_state, args.exp_dir / f"best_model_epoch-{epoch}.pth")
 
-            stats = dict(
-                log_suffix=log_suffix,
-                epoch=epoch,
-                acc1=top1.avg,
-                acc3=top3.avg,
-                best_acc1=best_acc.top1,
-                best_acc3=best_acc.top3,
-            )
+        stats = dict(
+            log_suffix=log_suffix,
+            epoch=epoch,
+            acc1=top1.avg,
+            acc3=top3.avg,
+            best_acc1=best_acc.top1,
+            best_acc3=best_acc.top3,
+        )
 
-            print(json.dumps(stats))
-            print(json.dumps(stats), file=stats_file)
+        print(json.dumps(stats))
+        print(json.dumps(stats), file=stats_file)
 
     for epoch in range(start_epoch, args.epochs):
-        train_sampler.set_epoch(epoch)
-        train_one_epoch(args, epoch, model, train_loader, criterion, optimizer, stats_file, model_ema)
-        evaluate(epoch, model, val_loader, stats_file)
-        if model_ema:
-            evaluate(epoch, model_ema, val_loader, stats_file, log_suffix="EMA")
-
+        train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file, model_ema)
         scheduler.step()
-        if args.rank == 0:
-            state = dict(
-                epoch=epoch + 1,
-                best_acc=best_acc,
-                model=model.state_dict(),
-                optimizer=optimizer.state_dict(),
-                scheduler=scheduler.state_dict(),
-            )
-            if model_ema:
-                state["model_ema"] = model_ema.state_dict()
-            torch.save(state, args.exp_dir / "checkpoint.pth")
+        evaluate(epoch, model, val_loader, device, stats_file)
+        if model_ema:
+            evaluate(epoch, model_ema, val_loader, device, stats_file, log_suffix="EMA")
+
+        state = dict(
+            epoch=epoch + 1,
+            best_acc=best_acc,
+            model=model.state_dict(),
+            optimizer=optimizer.state_dict(),
+            scheduler=scheduler.state_dict(),
+        )
+        if model_ema:
+            state["model_ema"] = model_ema.state_dict()
+        torch.save(state, args.exp_dir / "checkpoint.pth")
 
 
 def handle_sigusr1(signum, frame):
