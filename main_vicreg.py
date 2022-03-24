@@ -17,9 +17,11 @@ import torch
 import torchvision
 import torch.nn.functional as F
 from torch import nn, optim
+import torch.distributed as dist
 import torchvision.datasets as datasets
 
 import augmentations as aug
+from distributed import init_distributed_mode
 
 import utils
 import resnet
@@ -81,29 +83,45 @@ def get_arguments():
                         help='Covariance regularization loss coefficient')
 
     # Running
-    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=10)
+    parser.add_argument('--device', default='cuda',
+                        help='device to use for training / testing')
+
+    # Distributed
+    parser.add_argument('--world-size', default=1, type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--local_rank', default=-1, type=int)
+    parser.add_argument('--dist-url', default='env://',
+                        help='url used to set up distributed training')
 
     return parser
 
 
 def main(args):
-    print(args)
     set_seed(args.seed)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+    init_distributed_mode(args)
+    print(args)
+    gpu = torch.device(args.device)
 
-    args.exp_dir.mkdir(parents=True, exist_ok=True)
-    stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
-    print(" ".join(sys.argv))
-    print(" ".join(sys.argv), file=stats_file)
+    if args.rank == 0:
+        args.exp_dir.mkdir(parents=True, exist_ok=True)
+        stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
+        print(" ".join(sys.argv))
+        print(" ".join(sys.argv), file=stats_file)
 
     transforms = aug.TrainTransform()
 
     dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
+    assert args.batch_size % args.world_size == 0
+    per_device_batch_size = args.batch_size // args.world_size
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=per_device_batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
+        sampler=sampler,
     )
 
     if 'deit' in args.arch:
@@ -115,7 +133,9 @@ def main(args):
             zero_init_residual=True
         )
 
-    model = VICReg(args, backbone, embedding).to(device)
+    model = VICReg(args, backbone, embedding).cuda(gpu)
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
     if args.norm_weight_decay is None:
         parameters = model.parameters()
@@ -140,29 +160,33 @@ def main(args):
         model_ema = utils.ExponentialMovingAverage(model, device=device, decay=1.0 - alpha)
 
     if (args.exp_dir / "model.pth").is_file():
-        ckpt = torch.load(args.exp_dir / "model.pth", map_location="cpu")
-        start_epoch = ckpt["epoch"]
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        if model_ema:
-            model_ema.load_state_dict(ckpt["model_ema"])
-        print(f"Resuming from epoch {start_epoch}...")
+        if args.rank == 0:
+            ckpt = torch.load(args.exp_dir / "model.pth", map_location="cpu")
+            start_epoch = ckpt["epoch"]
+            model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            if model_ema:
+                model_ema.load_state_dict(ckpt["model_ema"])
+            print(f"Resuming from epoch {start_epoch}...")
     else:
         start_epoch = 0
 
-    def train_one_epoch(args, epoch, model, loader, device, optimizer, stats_file, model_ema=None):
+    def train_one_epoch(args, epoch, model, loader, optimizer, stats_file, model_ema=None):
         model.train()
         start_time = last_logging = time.time()
+        scaler = torch.cuda.amp.GradScaler()
         for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
-            x = x.to(device)
-            y = y.to(device)
+            x = x.cuda(gpu, non_blocking=True)
+            y = y.cuda(gpu, non_blocking=True)
 
             lr = adjust_learning_rate(args, optimizer, loader, step)
 
             optimizer.zero_grad()
-            loss = model.forward(x, y)
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast():
+                loss = model.forward(x, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             if model_ema and step % args.model_ema_steps == 0:
                 print(f"Updating EMA model params")
@@ -171,7 +195,7 @@ def main(args):
                     model_ema.n_averaged.fill_(0)
 
             current_time = time.time()
-            if current_time - last_logging > args.log_freq_time:
+            if args.rank == 0 and current_time - last_logging > args.log_freq_time:
                 stats = dict(
                     epoch=epoch,
                     step=step,
@@ -184,18 +208,19 @@ def main(args):
                 last_logging = current_time
 
     for epoch in range(start_epoch, args.epochs):
-        train_one_epoch(args, epoch, model, loader, device, optimizer, stats_file, model_ema)
+        train_one_epoch(args, epoch, model, loader, optimizer, stats_file, model_ema)
 
-        state = dict(
-            epoch=epoch + 1,
-            model=model.state_dict(),
-            optimizer=optimizer.state_dict(),
-        )
+        if args.rank == 0:
+            state = dict(
+                epoch=epoch + 1,
+                model=model.state_dict(),
+                optimizer=optimizer.state_dict(),
+            )
         if model_ema:
             state["model_ema"] = model_ema.state_dict()
         torch.save(state, args.exp_dir / "model.pth")
-
-    torch.save(model.backbone.state_dict(), args.exp_dir / "resnet50.pth")
+    if args.rank == 0:
+        torch.save(model.module.backbone.state_dict(), args.exp_dir / "resnet50.pth")
 
 
 def adjust_learning_rate(args, optimizer, loader, step):
@@ -230,6 +255,8 @@ class VICReg(nn.Module):
 
         repr_loss = F.mse_loss(x, y)
 
+        x = torch.cat(FullGatherLayer.apply(x), dim=0)
+        y = torch.cat(FullGatherLayer.apply(y), dim=0)
         x = x - x.mean(dim=0)
         y = y - y.mean(dim=0)
 
@@ -333,6 +360,25 @@ class LARS(optim.Optimizer):
 def batch_all_gather(x):
     x_list = FullGatherLayer.apply(x)
     return torch.cat(x_list, dim=0)
+
+
+class FullGatherLayer(torch.autograd.Function):
+    """
+    Gather tensors from all process and support backward propagation
+    for the gradients across processes.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
+        dist.all_gather(output, x)
+        return tuple(output)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        all_gradients = torch.stack(grads)
+        dist.all_reduce(all_gradients)
+        return all_gradients[dist.get_rank()]
 
 
 def handle_sigusr1(signum, frame):
