@@ -1,9 +1,11 @@
 from pathlib import Path
 import argparse
+import time
 
 from torch import nn
 from torchvision import datasets, transforms
 import torch
+
 import resnet
 
 
