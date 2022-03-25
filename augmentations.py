@@ -7,8 +7,10 @@
 
 from PIL import ImageOps, ImageFilter
 import numpy as np
+import torch
 import torchvision.transforms as transforms
-from torchvision.transforms.functional import InterpolationMode
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import autoaugment
 
 
 class GaussianBlur(object):

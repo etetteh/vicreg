@@ -81,7 +81,8 @@ def get_arguments():
                         help='Variance regularization loss coefficient')
     parser.add_argument("--cov-coeff", type=float, default=1.0,
                         help='Covariance regularization loss coefficient')
-
+    # Aug
+    parser.add_argument("--aug", action="store_true", help="enable auto data augmentation")
     # Running
     parser.add_argument("--num-workers", type=int, default=10)
     parser.add_argument('--device', default='cuda',
