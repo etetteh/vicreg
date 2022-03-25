@@ -87,6 +87,9 @@ def get_arguments():
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
 
+    # Aug
+    parser.add_argument("--aug", action="store_true", help="enable auto data augmentation")
+
     # Distributed
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of distributed processes')
@@ -111,6 +114,8 @@ def main(args):
         print(" ".join(sys.argv), file=stats_file)
 
     transforms = aug.TrainTransform()
+    if args.aug:
+        transforms = aug.StrongTrainTransform()
 
     dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)

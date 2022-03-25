@@ -87,3 +87,35 @@ class TrainTransform(object):
         x1 = self.transform(sample)
         x2 = self.transform_prime(sample)
         return x1, x2
+
+
+class StrongTrainTransform(object):
+    def __init__(self):
+        self.transform = transforms.Compose([
+            transforms.RandomResizedCrop(224, interpolation=InterpolationMode.BILINEAR),
+            transforms.RandomHorizontalFlip(),
+            autoaugment.TrivialAugmentWide(interpolation=InterpolationMode.BILINEAR),
+            transforms.PILToTensor(),
+            transforms.ConvertImageDtype(torch.float),
+            transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                ),
+            ]
+        )
+
+        self.transform_prime = transforms.Compose([
+            transforms.RandomResizedCrop(224, interpolation=InterpolationMode.BILINEAR),
+            transforms.RandomHorizontalFlip(),
+            autoaugment.RandAugment(interpolation=InterpolationMode.BILINEAR),
+            transforms.PILToTensor(),
+            transforms.ConvertImageDtype(torch.float),
+            transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                ),
+            ]
+        )
+
+    def __call__(self, sample):
+        x1 = self.transform(sample)
+        x2 = self.transform_prime(sample)
+        return x1, x2
