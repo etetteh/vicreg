@@ -4,6 +4,7 @@ import argparse
 from torch import nn
 from torchvision import datasets, transforms
 import torch
+import timm
 
 import resnet
 from timm.utils import accuracy, AverageMeter
@@ -54,7 +55,7 @@ def main_worker(args):
     # Data loading code
     testdir = args.data_dir / "test"
     normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        mean=timm.data.IMAGENET_DEFAULT_MEAN, std=timm.data.IMAGENET_DEFAULT_STD
     )
 
     test_dataset = datasets.ImageFolder(
