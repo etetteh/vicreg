@@ -11,6 +11,8 @@ import argparse
 import logging
 import json
 import os
+import random
+import signal
 import sys
 import copy
 import time
@@ -36,9 +38,11 @@ def get_arguments():
     parser = argparse.ArgumentParser(
         description="Evaluate a pretrained model"
     )
+
     parser.add_argument(
         "--seed", default=7, type=int, help="seed for reproducibility"
     )
+
     # Data
     parser.add_argument("--data-dir", type=Path, help="path to dataset")
     parser.add_argument(
@@ -58,7 +62,7 @@ def get_arguments():
         help="path to checkpoint directory",
     )
     parser.add_argument(
-        "--print-freq", default=25, type=int, metavar="N", help="print frequency"
+        "--print-freq", default=100, type=int, metavar="N", help="print frequency"
     )
 
     # Model
@@ -73,7 +77,7 @@ def get_arguments():
         help="number of total epochs to run",
     )
     parser.add_argument(
-        "--batch-size", default=128, type=int, metavar="N", help="mini-batch size"
+        "--batch-size", default=256, type=int, metavar="N", help="mini-batch size"
     )
     parser.add_argument(
         "--lr-backbone",
@@ -111,6 +115,7 @@ def get_arguments():
         type=float,
         help="the decay for lr"
     )
+
     # Running
     parser.add_argument(
         "--workers",
@@ -119,6 +124,7 @@ def get_arguments():
         metavar="N",
         help="number of data loader workers",
     )
+
     # Label smoothing
     parser.add_argument(
         "--label-smoothing",
@@ -127,6 +133,7 @@ def get_arguments():
         help="label smoothing",
         dest="label_smoothing"
     )
+
     # EMA
     parser.add_argument(
         "--model-ema",
@@ -145,6 +152,7 @@ def get_arguments():
         default=0.99998,
         help="Exponential Moving Average decay factor"
     )
+
     # Data Augmentation
     parser.add_argument(
         "--val-resize", default=256, type=int, help="validation data resize size"
@@ -165,7 +173,6 @@ def get_arguments():
 def main():
     parser = get_arguments()
     args = parser.parse_args()
-
     if args.train_percent != 100:
         if (args.data_dir / f'{args.train_percent}percent_train_subset.txt').is_file():
             print(f"Loading {args.train_percent} percent train subset images names...")
@@ -174,22 +181,40 @@ def main():
             print(f"Creating {args.train_percent} percent train subset images names...")
             create_subset.create_data_subset(dataset_path=args.data_dir, subset_percent=args.train_percent)
             args.train_files = open(args.data_dir / f'{args.train_percent}percent_train_subset.txt', 'r').readlines()
-    main_worker(args)
+
+    args.ngpus_per_node = torch.cuda.device_count()
+    if "SLURM_JOB_ID" in os.environ:
+        signal.signal(signal.SIGUSR1, handle_sigusr1)
+        signal.signal(signal.SIGTERM, handle_sigterm)
+    # single-node distributed training
+    args.rank = 0
+    args.dist_url = f"tcp://localhost:{random.randrange(49152, 65535)}"
+    args.world_size = args.ngpus_per_node
+    torch.multiprocessing.spawn(main_worker, (args,), args.ngpus_per_node)
 
 
-def main_worker(args):
+def main_worker(gpu, args):
+    args.rank += gpu
+    torch.distributed.init_process_group(
+        backend="nccl",
+        init_method=args.dist_url,
+        world_size=args.world_size,
+        rank=args.rank,
+    )
     set_seed(args.seed)
-    args.exp_dir.mkdir(parents=True, exist_ok=True)
-    stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
-    log_file = args.exp_dir / "log.txt"
+    if args.rank == 0:
+        args.exp_dir.mkdir(parents=True, exist_ok=True)
+        stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
+        log_file = args.exp_dir / "log.txt"
 
-    setup_default_logging(log_path=log_file)
-    _logger = logging.getLogger('finetune')
-    _logger.info(args)
-    _logger.info(" ".join(sys.argv))
-    print(" ".join(sys.argv), file=stats_file)
+        setup_default_logging(log_path=log_file)
+        _logger = logging.getLogger('finetune')
+        _logger.info(args)
+        _logger.info(" ".join(sys.argv))
+        print(" ".join(sys.argv), file=stats_file)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    torch.cuda.set_device(gpu)
+    torch.backends.cudnn.benchmark = True
 
     # Data loading code
     traindir = args.data_dir / "train"
@@ -271,14 +296,15 @@ def main_worker(args):
     head.weight.data.normal_(mean=0.0, std=0.01)
     head.bias.data.zero_()
     model = nn.Sequential(backbone, head)
-    model.to(device)
+    model.cuda(gpu)
 
     if args.weights == "freeze":
         backbone.requires_grad_(False)
         head.requires_grad_(True)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
-    train_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
-    criterion = nn.CrossEntropyLoss().to(device)
+    train_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(gpu)
+    criterion = nn.CrossEntropyLoss().cuda(gpu)
 
     param_groups = [dict(params=head.parameters(), lr=args.lr_head)]
     if args.weights == "finetune":
@@ -319,7 +345,7 @@ def main_worker(args):
         start_epoch = 0
         best_acc = argparse.Namespace(top1=0, top3=0)
 
-    def train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file, model_ema=None, ):
+    def train_one_epoch(args, epoch, model, train_loader, criterion, optimizer, stats_file, model_ema=None, ):
         if args.weights == "finetune":
             model.train()
         elif args.weights == "freeze":
@@ -329,12 +355,13 @@ def main_worker(args):
 
         batch_time = AverageMeter()
         losses = AverageMeter()
+        train_sampler.set_epoch(epoch)
         for step, (images, target) in enumerate(
-                train_loader, start=epoch * len(train_loader)
+            train_loader, start=epoch * len(train_loader)
         ):
             start_time = time.time()
-            output = model(images.to(device))
-            loss = criterion(output, target.to(device))
+            output = model(images.cuda(gpu, non_blocking=True))
+            loss = criterion(output, target.cuda(gpu, non_blocking=True))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -350,108 +377,113 @@ def main_worker(args):
             batch_time.update(end_time - start_time)
 
             if step % args.print_freq == 0:
-                pg = optimizer.param_groups
-                lr_head = pg[0]["lr"]
-                lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
-                _logger.info(
-                    'Training --> Epoch: {} | Step: [{}/{} ({:>3.0f}%)] | '
-                    'Loss: {loss.val:.3f} ({loss.avg:.3f}) | '
-                    'Time: {batch_time.val:.3f}s, {rate:.3f}/s ({batch_time.avg:.3f}s, {rate_avg:.3f}/s) | '
-                    'lr_backbone: {lr_backbone:.3e} | '
-                    'lr_head: {lr_head:.3e}'.format(epoch, step, len(train_loader) * args.epochs, 100. * step / (len(train_loader) * args.epochs),
-                                                    loss=losses,
-                                                    batch_time=batch_time,
-                                                    rate=images.size(0) / batch_time.val,
-                                                    rate_avg=images.size(0) / batch_time.avg,
-                                                    lr_backbone=lr_backbone,
-                                                    lr_head=lr_head
-                                                    )
-                )
+                torch.distributed.reduce(loss.div_(args.world_size), 0)
+                if args.rank == 0:
+                    pg = optimizer.param_groups
+                    lr_head = pg[0]["lr"]
+                    lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
+                    _logger.info(
+                        'Training --> Epoch: {} | Step: [{}/{} ({:>3.0f}%)] | '
+                        'Loss: {loss.val:.3f} ({loss.avg:.3f}) | '
+                        'Time: {batch_time.val:.3f}s, {rate:.3f}/s ({batch_time.avg:.3f}s, {rate_avg:.3f}/s) | '
+                        'lr_backbone: {lr_backbone:.3e} | '
+                        'lr_head: {lr_head:.3e}'.format(epoch, step, len(train_loader) * args.epochs, 100. * step / (len(train_loader) * args.epochs),
+                                                        loss=losses,
+                                                        batch_time=batch_time,
+                                                        rate=images.size(0) / batch_time.val,
+                                                        rate_avg=images.size(0) / batch_time.avg,
+                                                        lr_backbone=lr_backbone,
+                                                        lr_head=lr_head
+                                                        )
+                    )
 
-                stats = dict(
-                    epoch=epoch,
-                    step=step,
-                    lr_backbone=lr_backbone,
-                    lr_head=lr_head,
-                    loss=losses.avg,
-                )
-                print(json.dumps(stats), file=stats_file)
+                    stats = dict(
+                        epoch=epoch,
+                        step=step,
+                        lr_backbone=lr_backbone,
+                        lr_head=lr_head,
+                        loss=loss.item(),
+                        time=int(end_time - start_time),
+                    )
+                    print(json.dumps(stats))
+                    print(json.dumps(stats), file=stats_file)
 
-    def evaluate(epoch, model, val_loader, device, stats_file, log_suffix=""):
-        batch_time = AverageMeter()
-        losses = AverageMeter()
-        top1 = AverageMeter()
-        top3 = AverageMeter()
-
+    def evaluate(epoch, model, val_loader, stats_file, log_suffix=""):
         model.eval()
-        with torch.no_grad():
-            for step, (images, target) in enumerate(val_loader):
-                start_time = time.time()
-                output = model(images.to(device))
-                loss = criterion(output, target)
-                acc1, acc3 = accuracy(output.detach(), target.to(device), topk=(1, 3))
+        if args.rank == 0:
+            batch_time = AverageMeter()
+            losses = AverageMeter()
+            top1 = AverageMeter()
+            top3 = AverageMeter()
 
-                losses.update(loss.item(), images.size(0))
-                top1.update(acc1.item(), images.size(0))
-                top3.update(acc3.item(), images.size(0))
+            with torch.no_grad():
+                for step, (images, target) in enumerate(val_loader):
+                    start_time = time.time()
+                    output = model(images.cuda(gpu, non_blocking=True))
+                    loss = criterion(output, target)
+                    acc1, acc3 = accuracy(
+                        output, target.cuda(gpu, non_blocking=True), topk=(1, 3)
+                    )
+                    losses.update(loss.item(), images.size(0))
+                    top1.update(acc1.item(), images.size(0))
+                    top3.update(acc3.item(), images.size(0))
 
-                end_time = time.time()
-                batch_time.update(end_time - start_time)
+                    end_time = time.time()
+                    batch_time.update(end_time - start_time)
 
-        if top1.avg > best_acc.top1:
-            _logger.info(f"Acc@1 improved from {best_acc.top1:.3f}% to {top1.avg:.3f}%. Saving model state ... ")
-            best_acc.top1 = max(best_acc.top1, top1.avg)
-            best_acc.top3 = max(best_acc.top3, top3.avg)
-            best_model_state = copy.deepcopy(model.state_dict())
-            torch.save(best_model_state, args.exp_dir / f"best_model_epoch-{epoch}.pth")
+            if top1.avg > best_acc.top1:
+                _logger.info(f"Acc@1 improved from {best_acc.top1:.3f}% to {top1.avg:.3f}%. Saving model state ... ")
+                best_acc.top1 = max(best_acc.top1, top1.avg)
+                best_acc.top3 = max(best_acc.top3, top3.avg)
+                best_model_state = copy.deepcopy(model.state_dict())
+                torch.save(best_model_state, args.exp_dir / f"best_model_epoch-{epoch}.pth")
 
-        log_name = "Validating " + log_suffix
-        _logger.info(
-            '{} --> Epoch: {} | '
-            'Time: {batch_time.val:>.3f}s ({batch_time.avg:.3f}s) | '
-            'Loss: {loss.val:.3f} ({loss.avg:.3f}) | '
-            'Acc@1: {top1.val:.3f}% ({top1.avg:.3f}%) | '
-            'Acc@3: {top3.val:.3f}% ({top3.avg:.3f}%) | '
-            'Best Acc@1: {best_acc.top1:.3f}% | '
-            'Best Acc@3: {best_acc.top3:.3f}%'.format(log_name, epoch,
-                                                      batch_time=batch_time,
-                                                      loss=losses,
-                                                      top1=top1,
-                                                      top3=top3,
-                                                      best_acc=best_acc
-                                                      )
-        )
+            log_name = "Validating " + log_suffix
+            _logger.info(
+                '{} --> Epoch: {} | '
+                'Time: {batch_time.val:>.3f}s ({batch_time.avg:.3f}s) | '
+                'Loss: {loss.val:.3f} ({loss.avg:.3f}) | '
+                'Acc@1: {top1.val:.3f}% ({top1.avg:.3f}%) | '
+                'Acc@3: {top3.val:.3f}% ({top3.avg:.3f}%) | '
+                'Best Acc@1: {best_acc.top1:.3f}% | '
+                'Best Acc@3: {best_acc.top3:.3f}%'.format(log_name, epoch,
+                                                          batch_time=batch_time,
+                                                          loss=losses,
+                                                          top1=top1,
+                                                          top3=top3,
+                                                          best_acc=best_acc
+                                                          )
+            )
 
-        stats = dict(
-            log_suffix=log_suffix,
-            epoch=epoch,
-            time=round(batch_time.val, 4),
-            loss=round(losses.avg, 4),
-            acc1=round(top1.avg, 4),
-            acc3=round(top3.avg, 4),
-            best_acc1=round(best_acc.top1, 4),
-            best_acc3=round(best_acc.top3, 4),
-        )
-
+            stats = dict(
+                log_suffix=log_suffix,
+                epoch=epoch,
+                time=round(batch_time.val, 4),
+                loss=round(losses.avg, 4),
+                acc1=round(top1.avg, 4),
+                acc3=round(top3.avg, 4),
+                best_acc1=round(best_acc.top1, 4),
+                best_acc3=round(best_acc.top3, 4),
+            )
         print(json.dumps(stats), file=stats_file)
 
     for epoch in range(start_epoch, args.epochs):
-        train_one_epoch(args, epoch, model, train_loader, device, train_criterion, optimizer, stats_file, model_ema)
+        train_one_epoch(args, epoch, model, train_loader, train_criterion, optimizer, stats_file, model_ema)
+        evaluate(epoch, model, val_loader, stats_file)
+        if model_ema:
+            evaluate(epoch, model_ema, val_loader, stats_file, log_suffix="EMA")
         scheduler.step()
-        evaluate(epoch, model, val_loader, device, stats_file)
-        if model_ema:
-            evaluate(epoch, model_ema, val_loader, device, stats_file, log_suffix="EMA")
-
-        state = dict(
-            epoch=epoch + 1,
-            best_acc=best_acc,
-            model=model.state_dict(),
-            optimizer=optimizer.state_dict(),
-            scheduler=scheduler.state_dict(),
-        )
-        if model_ema:
-            state["model_ema"] = model_ema.state_dict()
-        torch.save(state, args.exp_dir / "checkpoint.pth")
+        if args.rank == 0:
+            state = dict(
+                epoch=epoch + 1,
+                best_acc=best_acc,
+                model=model.state_dict(),
+                optimizer=optimizer.state_dict(),
+                scheduler=scheduler.state_dict(),
+            )
+            if model_ema:
+                state["model_ema"] = model_ema.state_dict()
+            torch.save(state, args.exp_dir / "checkpoint.pth")
 
 
 def handle_sigusr1(signum, frame):

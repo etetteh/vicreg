@@ -19,10 +19,12 @@ import torch
 import torchvision
 import torch.nn.functional as F
 from torch import nn, optim
+import torch.distributed as dist
 import torchvision.datasets as datasets
 from timm.utils import AverageMeter, setup_default_logging
 
 import augmentations as aug
+from distributed import init_distributed_mode
 
 import utils
 import resnet
@@ -38,6 +40,7 @@ def get_arguments():
     parser.add_argument(
         "--seed", default=7, type=int, help="seed for reproducibility"
     )
+
     # Data
     parser.add_argument("--data-dir", type=Path, default="/path/to/imagenet", required=True,
                         help='Path to the image net dataset')
@@ -45,7 +48,7 @@ def get_arguments():
     # Checkpoints
     parser.add_argument("--exp-dir", type=Path, default="./exp",
                         help='Path to the experiment folder, where all logs/checkpoints will be stored')
-    parser.add_argument("--log-freq-time", type=int, default=25,
+    parser.add_argument("--log-freq-time", type=int, default=60,
                         help='Print logs to the stats.txt file every [log-freq-time] seconds')
 
     # Model
@@ -69,6 +72,7 @@ def get_arguments():
                         help="weight decay for Normalization layers (default: None, same value as --wd)", )
     parser.add_argument("--lr-warmup-epochs", default=0, type=int,
                         help="the number of epochs to warmup")
+
     # EMA
     parser.add_argument("--model-ema", action="store_true",
                         help="enable Exponential Moving Average of model parameters")
@@ -84,30 +88,44 @@ def get_arguments():
                         help='Variance regularization loss coefficient')
     parser.add_argument("--cov-coeff", type=float, default=1.0,
                         help='Covariance regularization loss coefficient')
-    #Aug
+
+    # Aug
     parser.add_argument("--aug", action="store_true", help="enable auto data augmentation")
     parser.add_argument(
         "--train-crop", default=224, type=int, help="training data random crop size"
     )
+
     # Running
-    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=10)
+    parser.add_argument('--device', default='cuda',
+                        help='device to use for training / testing')
+
+    # Distributed
+    parser.add_argument('--world-size', default=1, type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--local_rank', default=-1, type=int)
+    parser.add_argument('--dist-url', default='env://',
+                        help='url used to set up distributed training')
 
     return parser
 
 
 def main(args):
     set_seed(args.seed)
-    args.exp_dir.mkdir(parents=True, exist_ok=True)
-    stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
-    log_file = args.exp_dir / "log.txt"
+    torch.backends.cudnn.benchmark = True
+    init_distributed_mode(args)
+    gpu = torch.device(args.device)
 
-    setup_default_logging(log_path=log_file)
-    _logger = logging.getLogger('Pre-training')
-    _logger.info(args)
-    _logger.info(" ".join(sys.argv))
-    print(" ".join(sys.argv), file=stats_file)
+    if args.rank == 0:
+        args.exp_dir.mkdir(parents=True, exist_ok=True)
+        stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
+        log_file = args.exp_dir / "log.txt"
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        setup_default_logging(log_path=log_file)
+        _logger = logging.getLogger('Pre-training')
+        _logger.info(args)
+        _logger.info(" ".join(sys.argv))
+        print(" ".join(sys.argv), file=stats_file)
 
     transforms = aug.TrainTransform(args.train_crop)
     if args.aug:
@@ -117,11 +135,15 @@ def main(args):
     g.manual_seed(args.seed)
 
     dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
+    assert args.batch_size % args.world_size == 0
+    per_device_batch_size = args.batch_size // args.world_size
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=per_device_batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
+        sampler=sampler,
         worker_init_fn=set_worker_seed,
         generator=g,
     )
@@ -135,7 +157,9 @@ def main(args):
             zero_init_residual=True
         )
 
-    model = VICReg(args, backbone, embedding).to(device)
+    model = VICReg(args, backbone, embedding).cuda(gpu)
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
     if args.norm_weight_decay is None:
         parameters = model.parameters()
@@ -166,26 +190,32 @@ def main(args):
         optimizer.load_state_dict(ckpt["optimizer"])
         if model_ema:
             model_ema.load_state_dict(ckpt["model_ema"])
-        _logger.info(f"Resuming from epoch {start_epoch} ...")
+        if args.rank == 0:
+            print("resuming from checkpoint")
+            _logger.info(f"Resuming from epoch {start_epoch} ...")
     else:
         start_epoch = 0
 
-    def train_one_epoch(args, epoch, model, loader, device, optimizer, stats_file, model_ema=None):
+    def train_one_epoch(args, epoch, model, loader, optimizer, stats_file, model_ema=None):
         batch_time = AverageMeter()
         losses = AverageMeter()
         model.train()
 
+        scaler = torch.cuda.amp.GradScaler()
+        sampler.set_epoch(epoch)
         for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
             start_time = time.time()
-            x = x.to(device)
-            y = y.to(device)
+            x = x.cuda(gpu, non_blocking=True)
+            y = y.cuda(gpu, non_blocking=True)
 
             lr = adjust_learning_rate(args, optimizer, loader, step)
 
             optimizer.zero_grad()
-            loss = model.forward(x, y)
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast():
+                loss = model.forward(x, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             if model_ema and step % args.model_ema_steps == 0:
                 _logger.info(f"Updating EMA model params")
@@ -198,7 +228,7 @@ def main(args):
             end_time = time.time()
             batch_time.update(end_time - start_time)
 
-            if step % args.log_freq_time == 0:
+            if args.rank == 0 and end_time - start_time > args.log_freq_time:
                 _logger.info(
                     'Training --> Epoch: {} | Step: [{}/{} ({:>3.0f}%)] | '
                     'Loss: {loss.val:.3f} ({loss.avg:.3f}) | '
@@ -223,18 +253,19 @@ def main(args):
                 print(json.dumps(stats), file=stats_file)
 
     for epoch in range(start_epoch, args.epochs):
-        train_one_epoch(args, epoch, model, loader, device, optimizer, stats_file, model_ema)
+        train_one_epoch(args, epoch, model, loader, optimizer, stats_file, model_ema)
 
-        state = dict(
-            epoch=epoch + 1,
-            model=model.state_dict(),
-            optimizer=optimizer.state_dict(),
-        )
-        if model_ema:
-            state["model_ema"] = model_ema.state_dict()
-        torch.save(state, args.exp_dir / "model.pth")
-
-    torch.save(model.backbone.state_dict(), args.exp_dir / "resnet50.pth")
+        if args.rank == 0:
+            state = dict(
+                epoch=epoch + 1,
+                model=model.state_dict(),
+                optimizer=optimizer.state_dict(),
+            )
+            if model_ema:
+                state["model_ema"] = model_ema.state_dict()
+            torch.save(state, args.exp_dir / "model.pth")
+    if args.rank == 0:
+        torch.save(model.module.backbone.state_dict(), args.exp_dir / "resnet50.pth")
 
 
 def adjust_learning_rate(args, optimizer, loader, step):
@@ -269,6 +300,8 @@ class VICReg(nn.Module):
 
         repr_loss = F.mse_loss(x, y)
 
+        x = torch.cat(FullGatherLayer.apply(x), dim=0)
+        y = torch.cat(FullGatherLayer.apply(y), dim=0)
         x = x - x.mean(dim=0)
         y = y - y.mean(dim=0)
 
@@ -283,9 +316,9 @@ class VICReg(nn.Module):
         ) + off_diagonal(cov_y).pow_(2).sum().div(self.num_features)
 
         loss = (
-                self.args.sim_coeff * repr_loss
-                + self.args.std_coeff * std_loss
-                + self.args.cov_coeff * cov_loss
+            self.args.sim_coeff * repr_loss
+            + self.args.std_coeff * std_loss
+            + self.args.cov_coeff * cov_loss
         )
         return loss
 
@@ -314,14 +347,14 @@ def off_diagonal(x):
 
 class LARS(optim.Optimizer):
     def __init__(
-            self,
-            params,
-            lr,
-            weight_decay=0,
-            momentum=0.9,
-            eta=0.001,
-            weight_decay_filter=None,
-            lars_adaptation_filter=None,
+        self,
+        params,
+        lr,
+        weight_decay=0,
+        momentum=0.9,
+        eta=0.001,
+        weight_decay_filter=None,
+        lars_adaptation_filter=None,
     ):
         defaults = dict(
             lr=lr,
@@ -372,6 +405,25 @@ class LARS(optim.Optimizer):
 def batch_all_gather(x):
     x_list = FullGatherLayer.apply(x)
     return torch.cat(x_list, dim=0)
+
+
+class FullGatherLayer(torch.autograd.Function):
+    """
+    Gather tensors from all process and support backward propagation
+    for the gradients across processes.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
+        dist.all_gather(output, x)
+        return tuple(output)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        all_gradients = torch.stack(grads)
+        dist.all_reduce(all_gradients)
+        return all_gradients[dist.get_rank()]
 
 
 def handle_sigusr1(signum, frame):
