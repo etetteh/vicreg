@@ -12,6 +12,7 @@ import logging
 import json
 import os
 import sys
+import copy
 import time
 import timm
 import torch
@@ -401,7 +402,7 @@ def main_worker(args):
             _logger.info(f"Acc@1 improved from {best_acc.top1:.3f}% to {top1.avg:.3f}%. Saving model state ... ")
             best_acc.top1 = max(best_acc.top1, top1.avg)
             best_acc.top3 = max(best_acc.top3, top3.avg)
-            best_model_state = model.state_dict()
+            best_model_state = copy.deepcopy(model.state_dict())
             torch.save(best_model_state, args.exp_dir / f"best_model_epoch-{epoch}.pth")
 
         log_name = "Validating " + log_suffix

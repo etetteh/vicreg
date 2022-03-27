@@ -1,13 +1,6 @@
-import copy
-import datetime
-import errno
-import hashlib
-import os
-import time
 from collections import defaultdict, deque, OrderedDict
 
 import torch
-import torch.distributed as dist
 
 
 class ExponentialMovingAverage(torch.optim.swa_utils.AveragedModel):
