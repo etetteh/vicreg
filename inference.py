@@ -1,12 +1,12 @@
 from pathlib import Path
 import argparse
-import time
 
 from torch import nn
 from torchvision import datasets, transforms
 import torch
 
 import resnet
+from timm.utils import accuracy, AverageMeter
 
 
 def get_arguments():
@@ -33,7 +33,7 @@ def get_arguments():
     )
     # Data Augmentation
     parser.add_argument(
-        "--test-resize", default=240, type=int, help="validation data resize size"
+        "--test-resize", default=256, type=int, help="validation data resize size"
     )
     parser.add_argument(
         "--test-crop", default=224, type=int, help="validation data centre crop size"
@@ -89,62 +89,22 @@ def main_worker(args):
     def inference(model, test_loader, device):
         print(f"Running inference with {args.arch} on full test split...")
         model.eval()
-        top1 = AverageMeter("Acc@1", ":.3f")
-        top3 = AverageMeter("Acc@3", ":.3f")
+        top1 = AverageMeter()
+        top3 = AverageMeter()
         with torch.no_grad():
             for images, target in test_loader:
                 output = model(images.to(device))
                 acc1, acc3 = accuracy(
                         output, target.to(device), topk=(1, 3)
                 )
-                top1.update(acc1[0].item(), images.size(0))
-                top3.update(acc3[0].item(), images.size(0))
+                top1.update(acc1.item(), images.size(0))
+                top3.update(acc3.item(), images.size(0))
         return top1, top3
 
     #Run inference
     top1, top3 = inference(model, test_loader, device)
-    print(f"Inference results: {top1.avg:.3f}% | {top3.avg:.3f}%")
+    print(f"Inference results: Acc@1 {top1.avg:.3f}% | Acc@3 {top3.avg:.3f}%")
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self, name, fmt=":f"):
-        self.name = name
-        self.fmt = fmt
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-    def __str__(self):
-        fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
-        return fmtstr.format(**self.__dict__)
-
-
-def accuracy(output, target, topk=(1,)):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
-
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-        res = []
-        for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
 
 if __name__ == "__main__":
     main()

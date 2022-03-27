@@ -8,21 +8,28 @@
 
 from pathlib import Path
 import argparse
+import logging
 import json
 import os
 import sys
 import time
+import timm
+import torch
+import warnings
 
 from torch import nn, optim
 from torchvision import datasets, transforms
 from torchvision.transforms import autoaugment
 from torchvision.transforms.functional import InterpolationMode
-import torch
+from timm.utils import accuracy, AverageMeter, setup_default_logging
 
 import utils
 import resnet
 import create_subset
 from randoms import set_seed
+
+warnings.filterwarnings("ignore")
+
 
 def get_arguments():
     parser = argparse.ArgumentParser(
@@ -50,7 +57,7 @@ def get_arguments():
         help="path to checkpoint directory",
     )
     parser.add_argument(
-        "--print-freq", default=10, type=int, metavar="N", help="print frequency"
+        "--print-freq", default=25, type=int, metavar="N", help="print frequency"
     )
 
     # Model
@@ -147,7 +154,8 @@ def get_arguments():
     parser.add_argument(
         "--train-crop", default=224, type=int, help="training data random crop size"
     )
-    parser.add_argument("--auto-augment", default=None, type=str, choices=("trivial", "rand"), help="auto augment policy")
+    parser.add_argument("--auto-augment", default=None, type=str, choices=("trivial", "rand"),
+                        help="auto augment policy")
 
     parser.add_argument("--random-erase", default=0.0, type=float, help="random erasing probability")
     return parser
@@ -156,14 +164,15 @@ def get_arguments():
 def main():
     parser = get_arguments()
     args = parser.parse_args()
+
     if args.train_percent != 100:
         if (args.data_dir / f'{args.train_percent}percent_train_subset.txt').is_file():
             print(f"Loading {args.train_percent} percent train subset images names...")
-            args.train_files = open(args.data_dir/f'{args.train_percent}percent_train_subset.txt', 'r').readlines()
+            args.train_files = open(args.data_dir / f'{args.train_percent}percent_train_subset.txt', 'r').readlines()
         else:
             print(f"Creating {args.train_percent} percent train subset images names...")
             create_subset.create_data_subset(dataset_path=args.data_dir, subset_percent=args.train_percent)
-            args.train_files = open(args.data_dir/f'{args.train_percent}percent_train_subset.txt', 'r').readlines()
+            args.train_files = open(args.data_dir / f'{args.train_percent}percent_train_subset.txt', 'r').readlines()
     main_worker(args)
 
 
@@ -171,7 +180,12 @@ def main_worker(args):
     set_seed(args.seed)
     args.exp_dir.mkdir(parents=True, exist_ok=True)
     stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
-    print(" ".join(sys.argv))
+    log_file = args.exp_dir / "log.txt"
+
+    setup_default_logging(log_path=log_file)
+    _logger = logging.getLogger('finetune')
+    _logger.info(args)
+    _logger.info(" ".join(sys.argv))
     print(" ".join(sys.argv), file=stats_file)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -180,12 +194,12 @@ def main_worker(args):
     traindir = args.data_dir / "train"
     valdir = args.data_dir / "val"
     normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        mean=timm.data.IMAGENET_DEFAULT_MEAN, std=timm.data.IMAGENET_DEFAULT_STD
     )
 
     train_transforms = [
-            transforms.RandomResizedCrop(args.train_crop, interpolation=InterpolationMode.BILINEAR),
-            transforms.RandomHorizontalFlip()
+        transforms.RandomResizedCrop(args.train_crop, interpolation=InterpolationMode.BILINEAR),
+        transforms.RandomHorizontalFlip()
     ]
     if args.auto_augment == "trivial":
         train_transforms.append(autoaugment.TrivialAugmentWide(interpolation=InterpolationMode.BILINEAR))
@@ -193,10 +207,10 @@ def main_worker(args):
         train_transforms.append(autoaugment.RandAugment(interpolation=InterpolationMode.BILINEAR))
 
     train_transforms.extend([
-            transforms.PILToTensor(),
-            transforms.ConvertImageDtype(torch.float),
-            normalize,
-        ]
+        transforms.PILToTensor(),
+        transforms.ConvertImageDtype(torch.float),
+        normalize,
+    ]
     )
     if args.random_erase > 0:
         train_transforms.append(transforms.RandomErasing(p=args.random_erase))
@@ -257,7 +271,8 @@ def main_worker(args):
         backbone.requires_grad_(False)
         head.requires_grad_(True)
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
+    train_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
+    criterion = nn.CrossEntropyLoss().to(device)
 
     param_groups = [dict(params=head.parameters(), lr=args.lr_head)]
     if args.weights == "finetune":
@@ -268,8 +283,8 @@ def main_worker(args):
 
     if args.lr_warmup_epochs > 0:
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-                optimizer, start_factor=args.lr_warmup_decay, total_iters=args.lr_warmup_epochs
-            )
+            optimizer, start_factor=args.lr_warmup_decay, total_iters=args.lr_warmup_epochs
+        )
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[args.lr_warmup_epochs]
         )
@@ -293,22 +308,25 @@ def main_worker(args):
         scheduler.load_state_dict(ckpt["scheduler"])
         if model_ema:
             model_ema.load_state_dict(ckpt["model_ema"])
-        print(f"Resume training from epoch {start_epoch}...")
+        _logger.info(f"Resuming training from epoch {start_epoch} ...")
     else:
         start_epoch = 0
         best_acc = argparse.Namespace(top1=0, top3=0)
 
-    def train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file, model_ema=None,):
+    def train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file, model_ema=None, ):
         if args.weights == "finetune":
             model.train()
         elif args.weights == "freeze":
             model.eval()
         else:
             assert False
-        start_time = time.time()
+
+        batch_time = AverageMeter()
+        losses = AverageMeter()
         for step, (images, target) in enumerate(
-            train_loader, start=epoch * len(train_loader)
+                train_loader, start=epoch * len(train_loader)
         ):
+            start_time = time.time()
             output = model(images.to(device))
             loss = criterion(output, target.to(device))
             optimizer.zero_grad()
@@ -320,55 +338,99 @@ def main_worker(args):
                 if epoch < args.lr_warmup_epochs:
                     model_ema.n_averaged.fill_(0)
 
+            losses.update(loss.item(), images.size(0))
+
+            end_time = time.time()
+            batch_time.update(end_time - start_time)
+
             if step % args.print_freq == 0:
                 pg = optimizer.param_groups
                 lr_head = pg[0]["lr"]
                 lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
+                _logger.info(
+                    'Training --> Epoch: {} | Step: [{}/{} ({:>3.0f}%)] | '
+                    'Loss: {loss.val:.3f} ({loss.avg:.3f}) | '
+                    'Time: {batch_time.val:.3f}s, {rate:.3f}/s ({batch_time.avg:.3f}s, {rate_avg:.3f}/s) | '
+                    'lr_backbone: {lr_backbone:.3e} | '
+                    'lr_head: {lr_head:.3e}'.format(epoch, step, len(train_loader) * args.epochs, 100. * step / (len(train_loader) * args.epochs),
+                                                    loss=losses,
+                                                    batch_time=batch_time,
+                                                    rate=images.size(0) / batch_time.val,
+                                                    rate_avg=images.size(0) / batch_time.avg,
+                                                    lr_backbone=lr_backbone,
+                                                    lr_head=lr_head
+                                                    )
+                )
+
                 stats = dict(
                     epoch=epoch,
                     step=step,
                     lr_backbone=lr_backbone,
                     lr_head=lr_head,
-                    loss=loss.item(),
-                    time=time.strftime("%M:%S", time.gmtime(int(time.time() - start_time))),
+                    loss=losses.avg,
                 )
-                print(json.dumps(stats))
                 print(json.dumps(stats), file=stats_file)
 
     def evaluate(epoch, model, val_loader, device, stats_file, log_suffix=""):
+        batch_time = AverageMeter()
+        losses = AverageMeter()
+        top1 = AverageMeter()
+        top3 = AverageMeter()
+
         model.eval()
-        top1 = AverageMeter("Acc@1")
-        top3 = AverageMeter("Acc@3")
         with torch.no_grad():
-            for images, target in val_loader:
+            for step, (images, target) in enumerate(val_loader):
+                start_time = time.time()
                 output = model(images.to(device))
-                acc1, acc3 = accuracy(
-                        output, target.to(device), topk=(1, 3)
-                )
-                top1.update(acc1[0].item(), images.size(0))
-                top3.update(acc3[0].item(), images.size(0))
+                loss = criterion(output, target)
+                acc1, acc3 = accuracy(output.detach(), target.to(device), topk=(1, 3))
+
+                losses.update(loss.item(), images.size(0))
+                top1.update(acc1.item(), images.size(0))
+                top3.update(acc3.item(), images.size(0))
+
+                end_time = time.time()
+                batch_time.update(end_time - start_time)
 
         if top1.avg > best_acc.top1:
-            print(f"Acc@1 improved from {best_acc.top1:.3f}% to {top1.avg:.3f}%. Saving model state... ")
+            _logger.info(f"Acc@1 improved from {best_acc.top1:.3f}% to {top1.avg:.3f}%. Saving model state ... ")
             best_acc.top1 = max(best_acc.top1, top1.avg)
             best_acc.top3 = max(best_acc.top3, top3.avg)
             best_model_state = model.state_dict()
             torch.save(best_model_state, args.exp_dir / f"best_model_epoch-{epoch}.pth")
 
+        log_name = "Validating " + log_suffix
+        _logger.info(
+            '{} --> Epoch: {} | '
+            'Time: {batch_time.val:>.3f}s ({batch_time.avg:.3f}s) | '
+            'Loss: {loss.val:.3f} ({loss.avg:.3f}) | '
+            'Acc@1: {top1.val:.3f}% ({top1.avg:.3f}%) | '
+            'Acc@3: {top3.val:.3f}% ({top3.avg:.3f}%) | '
+            'Best Acc@1: {best_acc.top1:.3f}% | '
+            'Best Acc@3: {best_acc.top3:.3f}%'.format(log_name, epoch,
+                                                      batch_time=batch_time,
+                                                      loss=losses,
+                                                      top1=top1,
+                                                      top3=top3,
+                                                      best_acc=best_acc
+                                                      )
+        )
+
         stats = dict(
             log_suffix=log_suffix,
             epoch=epoch,
-            acc1=top1.avg,
-            acc3=top3.avg,
-            best_acc1=best_acc.top1,
-            best_acc3=best_acc.top3,
+            time=round(batch_time.val, 4),
+            loss=round(losses.avg, 4),
+            acc1=round(top1.avg, 4),
+            acc3=round(top3.avg, 4),
+            best_acc1=round(best_acc.top1, 4),
+            best_acc3=round(best_acc.top3, 4),
         )
 
-        print(json.dumps(stats))
         print(json.dumps(stats), file=stats_file)
 
     for epoch in range(start_epoch, args.epochs):
-        train_one_epoch(args, epoch, model, train_loader, device, criterion, optimizer, stats_file, model_ema)
+        train_one_epoch(args, epoch, model, train_loader, device, train_criterion, optimizer, stats_file, model_ema)
         scheduler.step()
         evaluate(epoch, model, val_loader, device, stats_file)
         if model_ema:
@@ -393,48 +455,6 @@ def handle_sigusr1(signum, frame):
 
 def handle_sigterm(signum, frame):
     pass
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self, name, fmt=":f"):
-        self.name = name
-        self.fmt = fmt
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-    def __str__(self):
-        fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
-        return fmtstr.format(**self.__dict__)
-
-
-def accuracy(output, target, topk=(1,)):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
-
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-        res = []
-        for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
 
 
 if __name__ == "__main__":

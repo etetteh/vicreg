@@ -12,12 +12,15 @@ import math
 import os
 import sys
 import time
+import logging
+import warnings
 
 import torch
 import torchvision
 import torch.nn.functional as F
 from torch import nn, optim
 import torchvision.datasets as datasets
+from timm.utils import AverageMeter, setup_default_logging
 
 import augmentations as aug
 
@@ -25,6 +28,8 @@ import utils
 import resnet
 from deit_models import deit
 from randoms import set_seed
+
+warnings.filterwarnings("ignore")
 
 
 def get_arguments():
@@ -40,7 +45,7 @@ def get_arguments():
     # Checkpoints
     parser.add_argument("--exp-dir", type=Path, default="./exp",
                         help='Path to the experiment folder, where all logs/checkpoints will be stored')
-    parser.add_argument("--log-freq-time", type=int, default=60,
+    parser.add_argument("--log-freq-time", type=int, default=25,
                         help='Print logs to the stats.txt file every [log-freq-time] seconds')
 
     # Model
@@ -61,14 +66,14 @@ def get_arguments():
     parser.add_argument("--norm-weight-decay",
                         default=None,
                         type=float,
-                        help="weight decay for Normalization layers (default: None, same value as --wd)",)
+                        help="weight decay for Normalization layers (default: None, same value as --wd)", )
     parser.add_argument("--lr-warmup-epochs", default=0, type=int,
                         help="the number of epochs to warmup")
     # EMA
     parser.add_argument("--model-ema", action="store_true",
                         help="enable Exponential Moving Average of model parameters")
     parser.add_argument("--model-ema-steps", type=int, default=32,
-                        help="number of iterations for updating EMA model",)
+                        help="number of iterations for updating EMA model", )
     parser.add_argument("--model-ema-decay", type=float, default=0.99998,
                         help="Exponential Moving Average decay factor")
 
@@ -81,6 +86,9 @@ def get_arguments():
                         help='Covariance regularization loss coefficient')
     #Aug
     parser.add_argument("--aug", action="store_true", help="enable auto data augmentation")
+    parser.add_argument(
+        "--train-crop", default=224, type=int, help="training data random crop size"
+    )
     # Running
     parser.add_argument("--num-workers", type=int, default=8)
 
@@ -88,18 +96,22 @@ def get_arguments():
 
 
 def main(args):
-    print(args)
     set_seed(args.seed)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
     args.exp_dir.mkdir(parents=True, exist_ok=True)
     stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
-    print(" ".join(sys.argv))
+    log_file = args.exp_dir / "log.txt"
+
+    setup_default_logging(log_path=log_file)
+    _logger = logging.getLogger('Pre-training')
+    _logger.info(args)
+    _logger.info(" ".join(sys.argv))
     print(" ".join(sys.argv), file=stats_file)
 
-    transforms = aug.TrainTransform()
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    transforms = aug.TrainTransform(args.train_crop)
     if args.aug:
-        transforms = aug.StrongTrainTransform()
+        transforms = aug.StrongTrainTransform(args.train_crop)
 
     dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
     loader = torch.utils.data.DataLoader(
@@ -149,14 +161,17 @@ def main(args):
         optimizer.load_state_dict(ckpt["optimizer"])
         if model_ema:
             model_ema.load_state_dict(ckpt["model_ema"])
-        print(f"Resuming from epoch {start_epoch}...")
+        _logger.info(f"Resuming from epoch {start_epoch} ...")
     else:
         start_epoch = 0
 
     def train_one_epoch(args, epoch, model, loader, device, optimizer, stats_file, model_ema=None):
+        batch_time = AverageMeter()
+        losses = AverageMeter()
         model.train()
-        start_time = last_logging = time.time()
+
         for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
+            start_time = time.time()
             x = x.to(device)
             y = y.to(device)
 
@@ -168,23 +183,39 @@ def main(args):
             optimizer.step()
 
             if model_ema and step % args.model_ema_steps == 0:
-                print(f"Updating EMA model params")
+                _logger.info(f"Updating EMA model params")
                 model_ema.update_parameters(model)
                 if epoch < args.lr_warmup_epochs:
                     model_ema.n_averaged.fill_(0)
 
-            current_time = time.time()
-            if current_time - last_logging > args.log_freq_time:
+            losses.update(loss.item(), x.size(0))
+
+            end_time = time.time()
+            batch_time.update(end_time - start_time)
+
+            if step % args.log_freq_time == 0:
+                _logger.info(
+                    'Training --> Epoch: {} | Step: [{}/{} ({:>3.0f}%)] | '
+                    'Loss: {loss.val:.3f} ({loss.avg:.3f}) | '
+                    'Time: {batch_time.val:.3f}s, {rate:.3f}/s ({batch_time.avg:.3f}s, {rate_avg:.3f}/s) | '
+                    'lr: {lr:.3e}'.format(epoch, step, len(loader) * args.epochs,
+                                          100. * step / (len(loader) * args.epochs),
+                                          loss=losses,
+                                          batch_time=batch_time,
+                                          rate=x.size(0) / batch_time.val,
+                                          rate_avg=x.size(0) / batch_time.avg,
+                                          lr=lr
+                                          )
+                )
                 stats = dict(
                     epoch=epoch,
                     step=step,
                     loss=loss.item(),
-                    time=time.strftime("%M:%S", time.gmtime(int(current_time - start_time))),
+                    time=int(end_time - start_time),
                     lr=lr,
                 )
-                print(json.dumps(stats))
+
                 print(json.dumps(stats), file=stats_file)
-                last_logging = current_time
 
     for epoch in range(start_epoch, args.epochs):
         train_one_epoch(args, epoch, model, loader, device, optimizer, stats_file, model_ema)
@@ -247,9 +278,9 @@ class VICReg(nn.Module):
         ) + off_diagonal(cov_y).pow_(2).sum().div(self.num_features)
 
         loss = (
-            self.args.sim_coeff * repr_loss
-            + self.args.std_coeff * std_loss
-            + self.args.cov_coeff * cov_loss
+                self.args.sim_coeff * repr_loss
+                + self.args.std_coeff * std_loss
+                + self.args.cov_coeff * cov_loss
         )
         return loss
 
@@ -278,14 +309,14 @@ def off_diagonal(x):
 
 class LARS(optim.Optimizer):
     def __init__(
-        self,
-        params,
-        lr,
-        weight_decay=0,
-        momentum=0.9,
-        eta=0.001,
-        weight_decay_filter=None,
-        lars_adaptation_filter=None,
+            self,
+            params,
+            lr,
+            weight_decay=0,
+            momentum=0.9,
+            eta=0.001,
+            weight_decay_filter=None,
+            lars_adaptation_filter=None,
     ):
         defaults = dict(
             lr=lr,

@@ -6,11 +6,12 @@
 
 
 from PIL import ImageOps, ImageFilter
-import numpy as np
+import timm
 import torch
+import numpy as np
 import torchvision.transforms as transforms
-from torchvision.transforms import InterpolationMode
 from torchvision.transforms import autoaugment
+from torchvision.transforms.functional import InterpolationMode
 
 
 class GaussianBlur(object):
@@ -37,11 +38,12 @@ class Solarization(object):
 
 
 class TrainTransform(object):
-    def __init__(self):
+    def __init__(self, train_crop):
+        self.train_crop = train_crop
         self.transform = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    224, interpolation=InterpolationMode.BICUBIC
+                    self.train_crop, interpolation=InterpolationMode.BICUBIC
                 ),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomApply(
@@ -57,14 +59,14 @@ class TrainTransform(object):
                 Solarization(p=0.0),
                 transforms.ToTensor(),
                 transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                    mean=timm.data.IMAGENET_DEFAULT_MEAN, std=timm.data.IMAGENET_DEFAULT_STD
                 ),
             ]
         )
         self.transform_prime = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    224, interpolation=InterpolationMode.BICUBIC
+                    self.train_crop, interpolation=InterpolationMode.BICUBIC
                 ),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomApply(
@@ -80,7 +82,7 @@ class TrainTransform(object):
                 Solarization(p=0.2),
                 transforms.ToTensor(),
                 transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                    mean=timm.data.IMAGENET_DEFAULT_MEAN, std=timm.data.IMAGENET_DEFAULT_STD
                 ),
             ]
         )
@@ -92,27 +94,28 @@ class TrainTransform(object):
 
 
 class StrongTrainTransform(object):
-    def __init__(self):
+    def __init__(self, train_crop):
+        self.train_crop = train_crop
         self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(224, interpolation=InterpolationMode.BILINEAR),
+            transforms.RandomResizedCrop(self.train_crop, interpolation=InterpolationMode.BILINEAR),
             transforms.RandomHorizontalFlip(),
             autoaugment.TrivialAugmentWide(interpolation=InterpolationMode.BILINEAR),
             transforms.PILToTensor(),
             transforms.ConvertImageDtype(torch.float),
             transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                    mean=timm.data.IMAGENET_DEFAULT_MEAN, std=timm.data.IMAGENET_DEFAULT_STD
                 ),
             ]
         )
 
         self.transform_prime = transforms.Compose([
-            transforms.RandomResizedCrop(224, interpolation=InterpolationMode.BILINEAR),
+            transforms.RandomResizedCrop(self.train_crop, interpolation=InterpolationMode.BILINEAR),
             transforms.RandomHorizontalFlip(),
             autoaugment.RandAugment(interpolation=InterpolationMode.BILINEAR),
             transforms.PILToTensor(),
             transforms.ConvertImageDtype(torch.float),
             transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                    mean=timm.data.IMAGENET_DEFAULT_MEAN, std=timm.data.IMAGENET_DEFAULT_STD
                 ),
             ]
         )
