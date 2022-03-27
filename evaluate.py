@@ -26,7 +26,7 @@ from timm.utils import accuracy, AverageMeter, setup_default_logging
 import utils
 import resnet
 import create_subset
-from randoms import set_seed
+from randoms import set_seed, set_worker_seed
 
 warnings.filterwarnings("ignore")
 
@@ -245,10 +245,15 @@ def main_worker(args):
     train_sampler = torch.utils.data.RandomSampler(train_dataset)
     val_sampler = torch.utils.data.SequentialSampler(val_dataset)
 
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     kwargs = dict(
         batch_size=args.batch_size,
         num_workers=args.workers,
         pin_memory=True,
+        worker_init_fn=set_worker_seed,
+        generator=g,
     )
     train_loader = torch.utils.data.DataLoader(
         train_dataset, sampler=train_sampler, **kwargs

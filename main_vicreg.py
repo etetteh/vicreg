@@ -27,7 +27,7 @@ import augmentations as aug
 import utils
 import resnet
 from deit_models import deit
-from randoms import set_seed
+from randoms import set_seed, set_worker_seed
 
 warnings.filterwarnings("ignore")
 
@@ -113,12 +113,17 @@ def main(args):
     if args.aug:
         transforms = aug.StrongTrainTransform(args.train_crop)
 
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
+        worker_init_fn=set_worker_seed,
+        generator=g,
     )
 
     if 'deit' in args.arch:
