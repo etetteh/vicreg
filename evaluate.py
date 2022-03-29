@@ -12,6 +12,7 @@ import logging
 import json
 import os
 import sys
+import copy
 import time
 import timm
 import torch
@@ -26,7 +27,7 @@ from timm.utils import accuracy, AverageMeter, setup_default_logging
 import utils
 import resnet
 import create_subset
-from randoms import set_seed
+from randoms import set_seed, set_worker_seed
 
 warnings.filterwarnings("ignore")
 
@@ -35,9 +36,11 @@ def get_arguments():
     parser = argparse.ArgumentParser(
         description="Evaluate a pretrained model"
     )
+
     parser.add_argument(
         "--seed", default=7, type=int, help="seed for reproducibility"
     )
+
     # Data
     parser.add_argument("--data-dir", type=Path, help="path to dataset")
     parser.add_argument(
@@ -57,7 +60,7 @@ def get_arguments():
         help="path to checkpoint directory",
     )
     parser.add_argument(
-        "--print-freq", default=25, type=int, metavar="N", help="print frequency"
+        "--print-freq", default=100, type=int, metavar="N", help="print frequency"
     )
 
     # Model
@@ -72,7 +75,7 @@ def get_arguments():
         help="number of total epochs to run",
     )
     parser.add_argument(
-        "--batch-size", default=128, type=int, metavar="N", help="mini-batch size"
+        "--batch-size", default=256, type=int, metavar="N", help="mini-batch size"
     )
     parser.add_argument(
         "--lr-backbone",
@@ -110,6 +113,7 @@ def get_arguments():
         type=float,
         help="the decay for lr"
     )
+
     # Running
     parser.add_argument(
         "--workers",
@@ -118,6 +122,7 @@ def get_arguments():
         metavar="N",
         help="number of data loader workers",
     )
+
     # Label smoothing
     parser.add_argument(
         "--label-smoothing",
@@ -126,6 +131,7 @@ def get_arguments():
         help="label smoothing",
         dest="label_smoothing"
     )
+
     # EMA
     parser.add_argument(
         "--model-ema",
@@ -144,6 +150,7 @@ def get_arguments():
         default=0.99998,
         help="Exponential Moving Average decay factor"
     )
+
     # Data Augmentation
     parser.add_argument(
         "--val-resize", default=256, type=int, help="validation data resize size"
@@ -245,10 +252,15 @@ def main_worker(args):
     train_sampler = torch.utils.data.RandomSampler(train_dataset)
     val_sampler = torch.utils.data.SequentialSampler(val_dataset)
 
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     kwargs = dict(
         batch_size=args.batch_size,
         num_workers=args.workers,
         pin_memory=True,
+        worker_init_fn=set_worker_seed,
+        generator=g,
     )
     train_loader = torch.utils.data.DataLoader(
         train_dataset, sampler=train_sampler, **kwargs
@@ -324,7 +336,7 @@ def main_worker(args):
         batch_time = AverageMeter()
         losses = AverageMeter()
         for step, (images, target) in enumerate(
-                train_loader, start=epoch * len(train_loader)
+            train_loader, start=epoch * len(train_loader)
         ):
             start_time = time.time()
             output = model(images.to(device))
@@ -368,16 +380,17 @@ def main_worker(args):
                     lr_backbone=lr_backbone,
                     lr_head=lr_head,
                     loss=losses.avg,
+                    time=int(end_time - start_time),
                 )
                 print(json.dumps(stats), file=stats_file)
 
     def evaluate(epoch, model, val_loader, device, stats_file, log_suffix=""):
+        model.eval()
         batch_time = AverageMeter()
         losses = AverageMeter()
         top1 = AverageMeter()
         top3 = AverageMeter()
 
-        model.eval()
         with torch.no_grad():
             for step, (images, target) in enumerate(val_loader):
                 start_time = time.time()
@@ -396,7 +409,7 @@ def main_worker(args):
             _logger.info(f"Acc@1 improved from {best_acc.top1:.3f}% to {top1.avg:.3f}%. Saving model state ... ")
             best_acc.top1 = max(best_acc.top1, top1.avg)
             best_acc.top3 = max(best_acc.top3, top3.avg)
-            best_model_state = model.state_dict()
+            best_model_state = copy.deepcopy(model.state_dict())
             torch.save(best_model_state, args.exp_dir / f"best_model_epoch-{epoch}.pth")
 
         log_name = "Validating " + log_suffix
@@ -426,16 +439,14 @@ def main_worker(args):
             best_acc1=round(best_acc.top1, 4),
             best_acc3=round(best_acc.top3, 4),
         )
-
         print(json.dumps(stats), file=stats_file)
 
     for epoch in range(start_epoch, args.epochs):
         train_one_epoch(args, epoch, model, train_loader, device, train_criterion, optimizer, stats_file, model_ema)
-        scheduler.step()
         evaluate(epoch, model, val_loader, device, stats_file)
         if model_ema:
             evaluate(epoch, model_ema, val_loader, device, stats_file, log_suffix="EMA")
-
+        scheduler.step()
         state = dict(
             epoch=epoch + 1,
             best_acc=best_acc,

@@ -27,7 +27,7 @@ import augmentations as aug
 import utils
 import resnet
 from deit_models import deit
-from randoms import set_seed
+from randoms import set_seed, set_worker_seed
 
 warnings.filterwarnings("ignore")
 
@@ -38,6 +38,7 @@ def get_arguments():
     parser.add_argument(
         "--seed", default=7, type=int, help="seed for reproducibility"
     )
+
     # Data
     parser.add_argument("--data-dir", type=Path, default="/path/to/imagenet", required=True,
                         help='Path to the image net dataset')
@@ -45,7 +46,7 @@ def get_arguments():
     # Checkpoints
     parser.add_argument("--exp-dir", type=Path, default="./exp",
                         help='Path to the experiment folder, where all logs/checkpoints will be stored')
-    parser.add_argument("--log-freq-time", type=int, default=25,
+    parser.add_argument("--log-freq-time", type=int, default=60,
                         help='Print logs to the stats.txt file every [log-freq-time] seconds')
 
     # Model
@@ -69,6 +70,7 @@ def get_arguments():
                         help="weight decay for Normalization layers (default: None, same value as --wd)", )
     parser.add_argument("--lr-warmup-epochs", default=0, type=int,
                         help="the number of epochs to warmup")
+
     # EMA
     parser.add_argument("--model-ema", action="store_true",
                         help="enable Exponential Moving Average of model parameters")
@@ -84,11 +86,13 @@ def get_arguments():
                         help='Variance regularization loss coefficient')
     parser.add_argument("--cov-coeff", type=float, default=1.0,
                         help='Covariance regularization loss coefficient')
-    #Aug
+
+    # Aug
     parser.add_argument("--aug", action="store_true", help="enable auto data augmentation")
     parser.add_argument(
         "--train-crop", default=224, type=int, help="training data random crop size"
     )
+
     # Running
     parser.add_argument("--num-workers", type=int, default=8)
 
@@ -113,12 +117,17 @@ def main(args):
     if args.aug:
         transforms = aug.StrongTrainTransform(args.train_crop)
 
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
+        worker_init_fn=set_worker_seed,
+        generator=g,
     )
 
     if 'deit' in args.arch:
@@ -278,9 +287,9 @@ class VICReg(nn.Module):
         ) + off_diagonal(cov_y).pow_(2).sum().div(self.num_features)
 
         loss = (
-                self.args.sim_coeff * repr_loss
-                + self.args.std_coeff * std_loss
-                + self.args.cov_coeff * cov_loss
+            self.args.sim_coeff * repr_loss
+            + self.args.std_coeff * std_loss
+            + self.args.cov_coeff * cov_loss
         )
         return loss
 
@@ -309,14 +318,14 @@ def off_diagonal(x):
 
 class LARS(optim.Optimizer):
     def __init__(
-            self,
-            params,
-            lr,
-            weight_decay=0,
-            momentum=0.9,
-            eta=0.001,
-            weight_decay_filter=None,
-            lars_adaptation_filter=None,
+        self,
+        params,
+        lr,
+        weight_decay=0,
+        momentum=0.9,
+        eta=0.001,
+        weight_decay_filter=None,
+        lars_adaptation_filter=None,
     ):
         defaults = dict(
             lr=lr,
