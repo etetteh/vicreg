@@ -191,7 +191,6 @@ def main(args):
         if model_ema:
             model_ema.load_state_dict(ckpt["model_ema"])
         if args.rank == 0:
-            print("resuming from checkpoint")
             _logger.info(f"Resuming from epoch {start_epoch} ...")
     else:
         start_epoch = 0

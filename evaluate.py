@@ -173,6 +173,7 @@ def get_arguments():
 def main():
     parser = get_arguments()
     args = parser.parse_args()
+
     if args.train_percent != 100:
         if (args.data_dir / f'{args.train_percent}percent_train_subset.txt').is_file():
             print(f"Loading {args.train_percent} percent train subset images names...")
@@ -397,16 +398,15 @@ def main_worker(gpu, args):
                                                         )
                     )
 
-                    stats = dict(
-                        epoch=epoch,
-                        step=step,
-                        lr_backbone=lr_backbone,
-                        lr_head=lr_head,
-                        loss=loss.item(),
-                        time=int(end_time - start_time),
-                    )
-                    print(json.dumps(stats))
-                    print(json.dumps(stats), file=stats_file)
+                stats = dict(
+                    epoch=epoch,
+                    step=step,
+                    lr_backbone=lr_backbone,
+                    lr_head=lr_head,
+                    loss=losses.avg,
+                    time=int(end_time - start_time),
+                )
+                print(json.dumps(stats), file=stats_file)
 
     def evaluate(epoch, model, val_loader, stats_file, log_suffix=""):
         model.eval()
@@ -422,7 +422,7 @@ def main_worker(gpu, args):
                     output = model(images.cuda(gpu, non_blocking=True))
                     loss = criterion(output, target)
                     acc1, acc3 = accuracy(
-                        output, target.cuda(gpu, non_blocking=True), topk=(1, 3)
+                        output.detach(), target.cuda(gpu, non_blocking=True), topk=(1, 3)
                     )
                     losses.update(loss.item(), images.size(0))
                     top1.update(acc1.item(), images.size(0))
@@ -465,7 +465,7 @@ def main_worker(gpu, args):
                 best_acc1=round(best_acc.top1, 4),
                 best_acc3=round(best_acc.top3, 4),
             )
-        print(json.dumps(stats), file=stats_file)
+            print(json.dumps(stats), file=stats_file)
 
     for epoch in range(start_epoch, args.epochs):
         train_one_epoch(args, epoch, model, train_loader, train_criterion, optimizer, stats_file, model_ema)
