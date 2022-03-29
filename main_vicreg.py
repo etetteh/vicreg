@@ -103,6 +103,7 @@ def get_arguments():
     # Distributed
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of distributed processes')
+    parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist-url', default='env://',
                         help='url used to set up distributed training')
 
@@ -114,13 +115,11 @@ def main(args):
     torch.backends.cudnn.benchmark = True
     init_distributed_mode(args)
     gpu = torch.device(args.device)
-    args.rank = int(os.environ["LOCAL_RANK"])
 
     if args.rank == 0:
         args.exp_dir.mkdir(parents=True, exist_ok=True)
         stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
         log_file = args.exp_dir / "log.txt"
-
         setup_default_logging(log_path=log_file)
         _logger = logging.getLogger('Pre-training')
         _logger.info(args)
@@ -159,7 +158,7 @@ def main(args):
 
     model = VICReg(args, backbone, embedding).cuda(gpu)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.rank], output_device=args.rank)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
     if args.norm_weight_decay is None:
         parameters = model.parameters()
@@ -184,6 +183,8 @@ def main(args):
         model_ema = utils.ExponentialMovingAverage(model, device=device, decay=1.0 - alpha)
 
     if (args.exp_dir / "model.pth").is_file():
+        if args.rank == 0:
+            print("resuming from checkpoint")
         ckpt = torch.load(args.exp_dir / "model.pth", map_location="cpu")
         start_epoch = ckpt["epoch"]
         model.load_state_dict(ckpt["model"])
@@ -248,7 +249,6 @@ def main(args):
                     time=int(end_time - start_time),
                     lr=lr,
                 )
-
                 print(json.dumps(stats), file=stats_file)
 
     for epoch in range(start_epoch, args.epochs):
