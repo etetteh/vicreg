@@ -6,7 +6,7 @@ import shutil
 import splitfolders
 from glob import glob
 
-def split_train_val_test(src_path: str, dst_path: str, split_ratio: tuple[float, float, float]):
+def split_train_val_test(src_path: str, dst_path: str, split_ratio: tuple):
     """
     The split_train_val_test function splits a multi-class images directory into
     train, validation, and test sub-folders according to a given ratio.
@@ -14,7 +14,7 @@ def split_train_val_test(src_path: str, dst_path: str, split_ratio: tuple[float,
     Args:
         src_path: source directory of multi-class images.
         dst_path: output directory where dataset splits are saved.
-        split_ratio: ratio of train, val, test splits. (0.70, 0.15, 0.15) represents
+        split_ratio tuple[float, float, float]: ratio of train, val, test splits. (0.70, 0.15, 0.15) represents
                      70% train set, 15% valid set and 15% test set.
     """
 

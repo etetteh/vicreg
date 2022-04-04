@@ -13,6 +13,7 @@ def set_seed(seed: int = 6):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.random.manual_seed(seed)
 
 
 def set_worker_seed(worker_id):
