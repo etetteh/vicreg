@@ -55,10 +55,10 @@ def load_data(config, data_dir=''):
     ])
 
     ######### Recipe 4 #########
-    if cfg.random_erase:
-        augment.append(transforms.RandomErasing(p=config["random_erase_prob"]))
-    elif cfg.random_erase_prob:
-        augment.append(transforms.RandomErasing(p=cfg.random_erase_prob))
+    # if cfg.random_erase:
+    #     augment.append(torchvision.transforms.RandomErasing(p=config["random_erase_prob"]))
+    # elif cfg.random_erase_prob:
+    #     augment.append(torchvision.transforms.RandomErasing(p=cfg.random_erase_prob))
     
     ######### Recipe 9 #########
     if cfg.fixres:
@@ -114,12 +114,11 @@ def train(config, pretrained='', checkpoint_dir=None, data_dir=None):
                 (data_dir + '/train/' + cls + "/" + fname, trainset.class_to_idx[cls])
             )
 
-
-    
     backbone, embedding = resnet.__dict__[cfg.model](zero_init_residual=True)
-    state_dict = torch.load(pretrained, map_location="cpu")
-    missing_keys, unexpected_keys = backbone.load_state_dict(state_dict, strict=False)
-    assert missing_keys == [] and unexpected_keys == []
+    if pretrained:
+        state_dict = torch.load(pretrained, map_location="cpu")
+        missing_keys, unexpected_keys = backbone.load_state_dict(state_dict, strict=False)
+        assert missing_keys == [] and unexpected_keys == []
 
     head = nn.Linear(embedding, len(trainset.classes))
     head.weight.data.normal_(mean=0.0, std=0.01)
@@ -216,8 +215,7 @@ def train(config, pretrained='', checkpoint_dir=None, data_dir=None):
         num_workers=cfg.workers,
         pin_memory=True
     )
-    
-    
+
     for epoch in range(cfg.epochs):
         train_one_epoch(config, epoch, train_loader, model, ema_model, optimizer, train_criterion, device=device)
 
@@ -241,8 +239,7 @@ def train(config, pretrained='', checkpoint_dir=None, data_dir=None):
         tune.report(loss=valid_loss, accuracy=accuracy)
     print("Finished Training")
     
-    
-    
+
 def train_one_epoch(config, epoch, train_loader, model, ema_model, optimizer, criterion, device="cpu"):
     if cfg.weights == "finetune":
         model.train()
@@ -266,7 +263,7 @@ def train_one_epoch(config, epoch, train_loader, model, ema_model, optimizer, cr
 
         running_loss += loss.item()
         epoch_steps += 1
-        if i % 2000 == 1999:  # print every 2000 mini-batches
+        if i % 2000 == 1999:
             print("[%d, %5d] loss: %.3f" % (epoch + 1, i + 1, running_loss / epoch_steps))
             running_loss = 0.0
 
@@ -274,13 +271,11 @@ def train_one_epoch(config, epoch, train_loader, model, ema_model, optimizer, cr
             if ema_model and i % config["model_ema_steps"] == 0:
                 ema_model.update_parameters(model)
                 if epoch < cfg.lr_warmup_epochs:
-                    # Reset ema buffer to keep copying weights during warmup period
                     ema_model.n_averaged.fill_(0)
-        elif (cfg.model_ema_decay and cfg.model_ema_steps):
+        elif cfg.model_ema_decay and cfg.model_ema_steps:
                 if ema_model and i % cfg.model_ema_steps == 0:
                     ema_model.update_parameters(model)
                     if epoch < cfg.lr_warmup_epochs:
-                        # Reset ema buffer to keep copying weights during warmup period
                         ema_model.n_averaged.fill_(0)
         
 
@@ -306,10 +301,9 @@ def validate(valid_loader, model, criterion, device="cpu"):
 
     valid_loss = valid_loss / valid_steps
     accuracy = correct / total
-    return  valid_loss, accuracy
+    return valid_loss, accuracy
    
-    
-    
+
 def main(cfg):
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -320,7 +314,9 @@ def main(cfg):
         torch.cuda.manual_seed_all(cfg.seed)
 
     data_dir = os.path.abspath(cfg.data_dir)
-    pretrained = os.path.abspath(cfg.pretrained)
+    pretrained = ""
+    if cfg.pretrained is not None:
+        pretrained = os.path.abspath(cfg.pretrained)
     
     config = {}
     hyperparam_mutations = {}
@@ -361,10 +357,10 @@ def main(cfg):
 
     ######### Recipe 4 #########  
     ### data aug ###
-    if cfg.random_erase:
-        config["random_erase_prob"] = tune.grid_search([0.1, 0.2, 0.3])
-        
-        hyperparam_mutations["random_erase_prob"] = [0.1, 0.3]
+    # if cfg.random_erase:
+    #     config["random_erase_prob"] = tune.uniform(0.2, 0.3)
+    #
+    #     hyperparam_mutations["random_erase_prob"] = [0.1, 0.3]
 
     ######### Recipe 5 ######### 
     ### label smoothing
@@ -444,14 +440,11 @@ def main(cfg):
         best_trial.last_result["loss"]))
     print("Best trial final validation accuracy: {}".format(
         best_trial.last_result["accuracy"]))
-    
-        
+
     return result    
     
-    
-    
-def get_args_parser(add_help=True):
 
+def get_args_parser(add_help=True):
     parser = argparse.ArgumentParser(description="Model Optimization Training", add_help=add_help)
     parser.add_argument("--data_dir", default="", type=Path, help="dataset path")
     parser.add_argument("--name", default="hparams_tune", type=str, help="")
@@ -465,7 +458,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--gpus_per_trial", default=0, type=int, help="")
     
     parser.add_argument("--weights", default="freeze", type=str, choices=("finetune", "freeze"), help="",)
-    parser.add_argument("--pretrained", type=str, help="")
+    parser.add_argument("--pretrained", type=Path, help="")
     parser.add_argument("--train_percent", default=100, type=int, help="",)
         
     ###### scheduler type
